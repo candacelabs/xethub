@@ -4,6 +4,7 @@
 set dotenv-load := true
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
+export COMPOSE_BAKE := "true"
 compose := "docker compose -f docker/compose.selfhost.yaml"
 compose_local := "docker compose -f docker/compose.local.yaml"
 image := "openxet-server"

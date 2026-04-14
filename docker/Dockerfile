@@ -17,7 +17,9 @@ RUN mkdir -p crates/hashing/src crates/chunking/src crates/cas_types/src crates/
     echo "" > crates/cas_types/src/lib.rs && \
     echo "fn main() {}" > crates/server/src/main.rs && \
     cargo build --release --bin openxet-server 2>/dev/null || true && \
-    rm -rf crates/
+    rm -rf crates/ && \
+    rm -f target/release/deps/libopenxet* target/release/deps/openxet* && \
+    rm -rf target/release/.fingerprint/openxet-*
 
 # Now copy actual source and build
 COPY crates/ crates/
