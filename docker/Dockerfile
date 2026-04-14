@@ -4,9 +4,23 @@ FROM rust:1.93-slim AS builder
 RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY Cargo.toml Cargo.lock ./
-COPY crates/ crates/
 
+# Cache dependencies: copy manifests first, build a dummy to populate the cache
+COPY Cargo.toml Cargo.lock ./
+COPY crates/hashing/Cargo.toml crates/hashing/Cargo.toml
+COPY crates/chunking/Cargo.toml crates/chunking/Cargo.toml
+COPY crates/cas_types/Cargo.toml crates/cas_types/Cargo.toml
+COPY crates/server/Cargo.toml crates/server/Cargo.toml
+RUN mkdir -p crates/hashing/src crates/chunking/src crates/cas_types/src crates/server/src && \
+    echo "" > crates/hashing/src/lib.rs && \
+    echo "" > crates/chunking/src/lib.rs && \
+    echo "" > crates/cas_types/src/lib.rs && \
+    echo "fn main() {}" > crates/server/src/main.rs && \
+    cargo build --release --bin openxet-server 2>/dev/null || true && \
+    rm -rf crates/
+
+# Now copy actual source and build
+COPY crates/ crates/
 RUN cargo build --release --bin openxet-server
 
 # ── Stage 2: Build frontend ──────────────────────────────────────────────────
@@ -22,7 +36,7 @@ RUN bun run build
 # ── Stage 3: Runtime ─────────────────────────────────────────────────────────
 FROM debian:trixie-slim
 
-RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y ca-certificates curl && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 

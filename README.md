@@ -11,8 +11,7 @@ This repo is the self-hosted version: runs on your own hardware, backed by MinIO
 ## Quick Start
 
 ```bash
-# Prerequisites: Rust, Docker, just, mise
-mise install
+# Prerequisites: Docker, just (optional: Rust + mise for local dev)
 
 # See available commands
 just
@@ -20,11 +19,14 @@ just
 # Deploy the full stack (MinIO + XetHub + Litestream + Caddy)
 just up
 
-# Run tests (includes 200MB dedup benchmark)
-just test
+# Or run just the server locally (filesystem storage, no MinIO)
+just dev
 
 # Generate an auth token
 just token
+
+# Run tests (requires Rust)
+just test
 ```
 
 ### Using with git-xet
