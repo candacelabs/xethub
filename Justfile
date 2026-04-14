@@ -5,8 +5,8 @@ set dotenv-load := true
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
 export COMPOSE_BAKE := "true"
-compose := "docker compose -f docker/compose.selfhost.yaml"
-compose_local := "docker compose -f docker/compose.local.yaml"
+compose := "docker compose -p openxet -f docker/compose.selfhost.yaml"
+compose_local := "docker compose -p openxet-local -f docker/compose.local.yaml"
 image := "openxet-server"
 dev_image := "openxet-dev"
 
@@ -28,6 +28,17 @@ dev:
 down:
     {{ compose }} down --remove-orphans
     {{ compose_local }} down --remove-orphans 2>/dev/null || true
+
+# Show container status, ports, and health
+status:
+    @{{ compose }} ps --format "table {{{{.Name}}\t{{{{.Status}}\t{{{{.Ports}}" 2>/dev/null; \
+     {{ compose_local }} ps --format "table {{{{.Name}}\t{{{{.Status}}\t{{{{.Ports}}" 2>/dev/null | tail -n +2; \
+     echo ""; \
+     curl -sf http://localhost:${CADDY_HTTP_PORT:-8880}/api/stats 2>/dev/null \
+        && echo "" \
+        || (curl -sf http://localhost:${OPENXET_PORT:-8080}/api/stats 2>/dev/null \
+            && echo "" \
+            || echo "⚠ Server not reachable")
 
 # Tail logs (optional: just log openxet)
 log *svc:
