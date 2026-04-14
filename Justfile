@@ -1,43 +1,43 @@
 # OpenXet — Self-hosted Xet Protocol CAS Server
+# Recipes print commands only — copy/paste to run.
 
 set dotenv-load := true
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
-export RUST_BACKTRACE := "1"
 compose := "docker compose -f docker/compose.selfhost.yaml"
 
-# Start everything (build + deploy self-hosted stack)
-up: build-release
-    {{ compose }} up -d --build --force-recreate --remove-orphans
-    @echo ""
-    @echo "Stack running. Generate a token:"
-    @echo "  just token"
+# Show how to start the self-hosted stack
+up:
+    @echo "cargo build --release"
+    @echo "{{ compose }} up -d --build --force-recreate --remove-orphans"
 
-# Stop everything
+# Show how to stop the stack
 down:
-    {{ compose }} down --remove-orphans
+    @echo "{{ compose }} down --remove-orphans"
 
-# Run all tests
+# Show how to run all tests
 test:
-    cargo test
+    @echo "RUST_BACKTRACE=1 cargo test"
 
-# Tail logs (optional: just log openxet)
+# Show how to tail logs (pass service name to filter)
 log *svc:
-    {{ compose }} logs --tail 100 -f {{ svc }}
+    @echo "{{ compose }} logs --tail 100 -f {{ svc }}"
 
-# Generate an auth token (default: write scope, 24h expiry)
+# Show how to generate an auth token
 token scope="write" repo="*/*":
-    cargo run -q -p openxet-server -- generate-token --scope {{ scope }} --repo "{{ repo }}"
+    @echo "cargo run -q -p openxet-server -- generate-token --scope {{ scope }} --repo \"{{ repo }}\""
 
-# ── Build ─────────────────────────────────────────────────────────────────────
-
+# Show build commands
 build-release:
-    cargo build --release
+    @echo "cargo build --release"
 
 fmt:
-    cargo fmt --all
+    @echo "cargo fmt --all"
 
 lint:
-    cargo clippy -- -D warnings
+    @echo "cargo clippy -- -D warnings"
 
-check: fmt lint test
+check:
+    @echo "cargo fmt --all"
+    @echo "cargo clippy -- -D warnings"
+    @echo "RUST_BACKTRACE=1 cargo test"
