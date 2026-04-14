@@ -1,203 +1,172 @@
-# OpenXet
+# XetHub
 
-A Rust implementation of a [Xet Protocol](https://huggingface.co/docs/xet/en/index)-compatible Content Addressable Storage (CAS) server with a web-based management UI. OpenXet provides content-addressed data storage with chunk-level deduplication, following the Xet Protocol Specification v1.0.0.
+A self-hosted [Xet Protocol](https://huggingface.co/docs/xet/en/index)-compatible Content Addressable Storage (CAS) server, designed for storing and versioning large ML models with chunk-level deduplication. Built on [OpenXet](https://github.com/ggoggam/openxet) with added SQLite indexes, presigned URL downloads, and a Docker Compose deployment stack backed by MinIO.
 
-## Overview
+## Why
 
-OpenXet breaks files into content-defined chunks using a Gearhash CDC algorithm, hashes them with Blake3, and stores them in deduplicated xorb archives. Files are reconstructed by looking up chunk references stored in shard metadata. This enables efficient storage and transfer of large files with automatic deduplication at the chunk level.
+Pushing a 140GB model to git takes forever. Fine-tuning changes ~5% of weights, but without dedup you re-upload the entire thing. XetHub breaks files into content-defined chunks — only changed chunks get uploaded. A 5% tweak to a 70B model uploads ~7GB instead of 140GB.
 
-### Key Features
+This repo is the self-hosted version: runs on your own hardware, backed by MinIO (S3-compatible), with SQLite indexes replicated via Litestream for disaster recovery. Pairs with an existing Gitea instance — Gitea stores git history, XetHub stores the large file data.
 
-- **Content-Defined Chunking** -- Gearhash-based CDC (8--128 KiB chunks, 64 KiB target) for stable chunk boundaries across file revisions
-- **Content-Addressed Storage** -- Blake3 keyed hashing with aggregated merkle trees for xorb and file identification
-- **Chunk-Level Deduplication** -- Global dedup via HMAC-protected chunk hash queries
-- **Binary Formats** -- Xorb (chunk archive) and Shard (file metadata) serialization with LZ4 frame compression
-- **Web UI** -- React dashboard for browsing files, inspecting xorbs, uploading data, and querying tabular files with DuckDB WASM
-- **Docker Support** -- Multi-stage Dockerfile and Docker Compose for single-command deployment
-
-## Getting Started
-
-### Prerequisites
-
-- [Rust](https://www.rust-lang.org/tools/install) (latest stable)
-- [mise](https://mise.jdx.dev/) (recommended for toolchain management)
-- [bun](https://bun.sh/) (for frontend)
-
-### Setup
+## Quick Start
 
 ```bash
-# Clone the repository
-git clone https://github.com/ggoggam/openxet.git
-cd openxet
-
-# Install toolchain via mise (optional but recommended)
-mise trust
+# Prerequisites: Rust, Docker, just, mise
 mise install
 
-# Build server and frontend
-cargo build
-cd web && bun install && bun run build && cd ..
+# See available commands
+just
+
+# Deploy the full stack (MinIO + XetHub + Litestream + Caddy)
+just up
+
+# Run tests (includes 200MB dedup benchmark)
+just test
+
+# Generate an auth token
+just token
 ```
 
-### Running
+### Using with git-xet
 
 ```bash
-cargo run          # Run the server (serves API + static frontend on port 8080)
-```
+# Point git-xet at your server
+export HF_XET_DATA_DEFAULT_CAS_ENDPOINT=http://your-xethub-host:8080
 
-### Running with Docker
+# One-time setup
+git xet install
+git xet track "*.safetensors" "*.bin" "*.pt"
 
-```bash
-docker compose -f docker/compose.yaml up -d --build
-```
-
-The server will be available at `http://localhost:8080`. Set `OPENXET_AUTH_SECRET` in the compose file for JWT authentication.
-
-### Testing
-
-```bash
-cargo test         # Run all tests
-cargo test --lib   # Unit tests only
-cargo clippy       # Lint
-cargo fmt --check  # Check formatting
+# Normal git workflow — xet handles large file chunking transparently
+git add .
+git commit -m "fine-tuned model v2"
+git push  # only changed chunks are uploaded
 ```
 
 ## Architecture
 
-OpenXet is organized as a Cargo workspace with four crates:
-
 ```
-openxet/
-├── crates/
-│   ├── hashing/       # MerkleHash, Blake3 keyed hashing, aggregated merkle tree
-│   ├── chunking/      # Gearhash content-defined chunking (CDC)
-│   ├── cas_types/     # Xorb/Shard binary formats, chunk compression, reconstruction types
-│   └── server/        # HTTP server (axum) with auth, storage, and management API
-├── web/               # React frontend (TypeScript, Vite, TailwindCSS)
-├── docker/            # Dockerfile and Docker Compose
-├── spec/              # Protocol specification
-└── test_data/         # Reference files from xet-spec-reference-files
-```
-
-### Crate Dependency Graph
-
-```
-server
-  ├── cas_types
-  │     └── hashing
-  ├── chunking
-  └── hashing
+┌─────────────┐     ┌──────────────┐     ┌─────────────┐
+│   Gitea     │     │   XetHub     │     │    MinIO     │
+│  (git repo) │     │  (CAS API)   │────▶│  (S3 store)  │
+└─────────────┘     └──────────────┘     └─────────────┘
+       │                    │
+       │            ┌──────────────┐
+       │            │   SQLite     │──── Litestream ──▶ MinIO backup
+       │            │  (indexes)   │
+       │            └──────────────┘
+       │
+  git push/pull         ▲
+  (pointers)            │ chunked upload/download
+       │                │ (presigned URLs)
+       ▼                ▼
+    ┌─────────────────────┐
+    │      git-xet        │
+    │  (transfer agent)   │
+    └─────────────────────┘
 ```
 
-### API
+- **Gitea** — stores git history, `.gitattributes`, LFS pointer files
+- **XetHub** — CAS server with SQLite-backed file/chunk/xorb indexes
+- **MinIO** — S3-compatible object storage for xorbs and shards
+- **Litestream** — continuous SQLite replication to MinIO for DR
+- **Caddy** — reverse proxy (optional HTTPS)
+- **git-xet** — LFS custom transfer agent, handles CDC chunking transparently
 
-#### CAS Protocol Endpoints
+### Crate Structure
+
+```
+crates/
+├── hashing/       # MerkleHash, Blake3 keyed hashing, aggregated merkle tree
+├── chunking/      # Gearhash content-defined chunking (CDC)
+├── cas_types/     # Xorb/Shard binary formats, chunk compression
+└── server/        # HTTP server (axum) with auth, storage, indexes, routes
+```
+
+### Self-Hosted Stack (Docker Compose)
+
+```bash
+just up
+# Starts: MinIO (:9000) + XetHub (:8080) + Litestream + Caddy (:80)
+```
+
+Defined in `docker/compose.selfhost.yaml`. Configuration via environment variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `OPENXET_AUTH_SECRET` | `change-me-in-production` | JWT signing secret |
+| `OPENXET_INDEX_BACKEND` | `sqlite` | Index backend (`sqlite` or `filesystem`) |
+| `OPENXET_EXTERNAL_S3_URL` | `http://localhost:9000` | Public MinIO URL for presigned downloads |
+| `OPENXET_PRESIGNED_URL_EXPIRY` | `3600` | Presigned URL TTL in seconds |
+| `MINIO_ROOT_USER` | `minioadmin` | MinIO credentials |
+| `MINIO_ROOT_PASSWORD` | `minioadmin` | MinIO credentials |
+
+### Dedup Performance
+
+From the benchmark test (`cargo test --test dedup_benchmark -- --nocapture`):
+
+```
+═══ DEDUP SAVINGS ═══
+  Original:       200 MB uploaded
+  Tweaked (naive): 200 MB would be uploaded
+  Tweaked (dedup): 60 MB actually uploaded
+  Savings:        70%
+  Speedup:        3.3x
+```
+
+At scale (140GB model, ~2300 xorbs), a 5% localized change reuses ~95% of xorbs → **~20x speedup**.
+
+## API
+
+### CAS Protocol
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/v1/reconstructions/{file_id}` | File reconstruction (supports Range header) |
+| `GET` | `/v1/reconstructions/{file_id}` | File reconstruction (supports Range header, presigned URLs) |
 | `GET` | `/v1/chunks/default-merkledb/{hash}` | Global chunk deduplication query |
 | `GET` | `/v1/xorbs/default/{hash}` | Download a xorb |
 | `POST` | `/v1/xorbs/default/{hash}` | Upload a serialized xorb |
 | `POST` | `/v1/shards` | Upload shard metadata (registers files) |
 
-#### Management API
+### Management
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/api/stats` | Storage statistics (file/xorb/shard counts, total size) |
-| `GET` | `/api/files` | List all stored files |
-| `GET` | `/api/files/{hash}` | File detail with reconstruction info |
-| `GET` | `/api/files/{hash}/content` | Download reconstructed file content |
-| `GET` | `/api/xorbs` | List all xorbs with chunk counts |
-| `POST` | `/api/upload` | Single-shot file upload (chunks, hashes, stores) |
+| `GET` | `/api/stats` | Storage statistics |
+| `GET` | `/api/files` | List stored files |
+| `GET` | `/api/files/{hash}/content` | Download reconstructed file |
+| `POST` | `/api/upload` | Single-shot file upload |
 
-#### Multipart Upload API
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/api/upload/init` | Initialize an upload session |
-| `PUT` | `/api/upload/{session_id}/{part_index}` | Upload a part |
-| `POST` | `/api/upload/{session_id}/complete` | Finalize the upload |
-| `DELETE` | `/api/upload/{session_id}` | Abort the upload |
-
-### Storage Layout
-
-```
-{data_dir}/
-├── xorbs/default/{hash}    # Chunk archives
-├── shards/{hash}           # File metadata
-├── index/
-│   ├── files/              # file_hash → shard_hash mapping
-│   └── chunks/             # chunk_hash → (xorb_hash, chunk_index) mapping
-└── uploads/tmp/            # Temporary multipart upload files
-```
-
-## Frontend
-
-The web UI is a React SPA built with TypeScript, Vite, and TailwindCSS. It provides:
-
-- **Dashboard** -- Storage statistics overview
-- **File browser** -- List files, view reconstruction details, download content
-- **Xorb inspector** -- Browse xorb archives and chunk metadata
-- **File upload** -- Drag-and-drop upload with automatic chunking and deduplication
-- **Table preview** -- Query CSV/Parquet files in-browser using DuckDB WASM with a SQL editor
-
-### Frontend Stack
-
-React 19, TypeScript, Vite 7, TailwindCSS 4, TanStack Router + Query, Radix UI / shadcn, DuckDB WASM, CodeMirror (SQL editor)
-
-### Development
+### CLI Subcommands
 
 ```bash
-cd web
-bun install        # Install dependencies
-bun run dev        # Dev server with HMR
-bun run build      # Production build (output: web/dist/)
-bun run lint       # ESLint
+openxet-server serve              # Run the server (default)
+openxet-server generate-token     # Generate a JWT auth token
+openxet-server rebuild-index      # Rebuild SQLite indexes from stored shards
 ```
-
-## Protocol Details
-
-OpenXet implements several non-trivial aspects of the Xet protocol:
-
-- **Hash encoding** -- 32-byte hashes are hex-encoded with LE octet reversal per 8-byte segment
-- **Merkle tree** -- Variable-branching aggregated tree (mean branching factor 4), not a flat hash
-- **Chunk compression** -- Per-chunk LZ4 frame compression (not raw blocks)
-- **Shard format** -- Magic tag `"HFRepoMetaData\0"` + sentinel bytes; upload shards omit the footer
-
-See [`spec/SPECIFICATION.md`](spec/SPECIFICATION.md) for the full protocol specification.
 
 ## Development
 
-### Mise Tasks
-
-The project uses [mise](https://mise.jdx.dev/) for task automation:
-
 ```bash
-mise run build           # Build all crates (debug)
-mise run build-release   # Build all crates (release)
-mise run test            # Run all tests
-mise run lint            # Run clippy
-mise run check           # Format check + clippy + tests
-mise run dev             # Build everything and run the server
-mise run fe-build        # Build frontend
-mise run jwt             # Generate a JWT token for testing
-mise run up              # Docker compose up
-mise run down            # Docker compose down
+just test      # All tests (76 tests including integration + dedup benchmark)
+just fmt       # Format
+just lint      # Clippy
+just check     # fmt + lint + test
 ```
 
-### Code Conventions
+### Disaster Recovery
 
-- Error types via `thiserror`; application errors via `anyhow`
-- Async runtime: `tokio`; HTTP framework: `axum`
-- All binary formats use little-endian byte order
-- Shard entries are fixed at 48 bytes (FileInfo and CASInfo)
+SQLite indexes are continuously replicated to MinIO via Litestream. To restore:
 
-### Reference Test Data
-
-Integration tests validate against official reference files from the [xet-spec-reference-files](https://huggingface.co/datasets/xet-team/xet-spec-reference-files) dataset on HuggingFace. These live in `test_data/` and cover chunk hashing, file hashing, merkle tree construction, and xorb/shard deserialization.
+```bash
+litestream restore -o /data/index.db s3://litestream/index.db
+# Or: openxet-server rebuild-index (slower, scans all shards)
+```
 
 ## License
 
-This project is licensed under the [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0).
+[Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0)
+
+## Acknowledgments
+
+Based on [OpenXet](https://github.com/ggoggam/openxet) by ggoggam. Protocol spec: [Xet Protocol v1.0.0](https://huggingface.co/docs/xet/en/index).
