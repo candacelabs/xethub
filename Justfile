@@ -1,43 +1,42 @@
 # OpenXet — Self-hosted Xet Protocol CAS Server
-# Recipes print commands only — copy/paste to run.
 
 set dotenv-load := true
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
+export RUST_BACKTRACE := "1"
 compose := "docker compose -f docker/compose.selfhost.yaml"
 
-# Show how to start the self-hosted stack
-up:
-    @echo "cargo build --release"
-    @echo "{{ compose }} up -d --build --force-recreate --remove-orphans"
+# List available recipes
+default:
+    @just --list
 
-# Show how to stop the stack
+# Start everything (build + deploy self-hosted stack)
+up: build-release
+    {{ compose }} up -d --build --force-recreate --remove-orphans
+
+# Stop everything
 down:
-    @echo "{{ compose }} down --remove-orphans"
+    {{ compose }} down --remove-orphans
 
-# Show how to run all tests
+# Run all tests
 test:
-    @echo "RUST_BACKTRACE=1 cargo test"
+    cargo test
 
-# Show how to tail logs (pass service name to filter)
+# Tail logs (optional: just log openxet)
 log *svc:
-    @echo "{{ compose }} logs --tail 100 -f {{ svc }}"
+    {{ compose }} logs --tail 100 -f {{ svc }}
 
-# Show how to generate an auth token
+# Generate an auth token (default: write scope, 24h expiry)
 token scope="write" repo="*/*":
-    @echo "cargo run -q -p openxet-server -- generate-token --scope {{ scope }} --repo \"{{ repo }}\""
+    cargo run -q -p openxet-server -- generate-token --scope {{ scope }} --repo "{{ repo }}"
 
-# Show build commands
 build-release:
-    @echo "cargo build --release"
+    cargo build --release
 
 fmt:
-    @echo "cargo fmt --all"
+    cargo fmt --all
 
 lint:
-    @echo "cargo clippy -- -D warnings"
+    cargo clippy -- -D warnings
 
-check:
-    @echo "cargo fmt --all"
-    @echo "cargo clippy -- -D warnings"
-    @echo "RUST_BACKTRACE=1 cargo test"
+check: fmt lint test
