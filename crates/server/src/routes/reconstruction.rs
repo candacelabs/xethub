@@ -11,10 +11,12 @@ use openxet_cas_types::reconstruction::{
 };
 use openxet_cas_types::shard::Shard;
 
+use std::time::Duration;
+
 use crate::auth::RequireRead;
 use crate::error::AppError;
 use crate::state::AppState;
-use crate::storage::{FileIndex, StorageBackend, validate_hash};
+use crate::storage::{FileIndex, StorageBackend, XorbMetadataIndex, validate_hash};
 
 /// Parse an HTTP Range header of the form "bytes=start-end" (inclusive end).
 pub fn parse_range_header(headers: &HeaderMap) -> Result<Option<(u64, u64)>, AppError> {
@@ -165,8 +167,18 @@ pub async fn get_reconstruction(
             continue;
         }
 
-        let xorb_data = state.storage.get_xorb(&term.hash).await?;
-        let chunk_offsets = compute_chunk_byte_offsets(&xorb_data);
+        // Fast path: use cached xorb metadata for byte offsets
+        let metadata = state.xorb_metadata_index.get(&term.hash).await?;
+        let chunk_offsets: Vec<(u64, u64)> = if !metadata.is_empty() {
+            metadata
+                .iter()
+                .map(|m| (m.compressed_offset_start, m.compressed_offset_end))
+                .collect()
+        } else {
+            // Slow path: parse xorb from storage (filesystem mode fallback)
+            let xorb_data = state.storage.get_xorb(&term.hash).await?;
+            compute_chunk_byte_offsets(&xorb_data)
+        };
 
         // Build fetch info covering the chunks this term needs
         let start_idx = term.range.start;
@@ -176,11 +188,19 @@ pub async fn get_reconstruction(
             let byte_start = chunk_offsets[start_idx].0;
             let byte_end = chunk_offsets[end_idx - 1].1 - 1; // inclusive for HTTP Range
 
+            // Try presigned URL first, fall back to server URL
+            let expiry =
+                Duration::from_secs(state.config.storage.presigned_url_expiry_seconds);
+            let url = match state.storage.presign_xorb_url(&term.hash, expiry).await? {
+                Some(presigned) => presigned.to_string(),
+                None => format!("{base_url}/v1/xorbs/default/{}", term.hash),
+            };
+
             fetch_info.insert(
                 term.hash.clone(),
                 vec![CASReconstructionFetchInfo {
                     range: term.range,
-                    url: format!("{base_url}/v1/xorbs/default/{}", term.hash),
+                    url,
                     url_range: ByteRange {
                         start: byte_start,
                         end: byte_end,

@@ -1,0 +1,58 @@
+// spec/contracts/presign.proto
+//
+// Typed contracts for agent A4 (Presigned URL Infrastructure).
+// Describes changes to ObjectStoreBackend, StorageDispatch, and builder.
+
+syntax = "proto3";
+package openxet.agent.presign;
+
+// ─── ObjectStoreBackend changes ──────────────────────────────────────────────
+// File: crates/server/src/storage/object_store_backend.rs
+
+message ObjectStoreBackendChanges {
+  // Add signer field:
+  // pub struct ObjectStoreBackend {
+  //     store: Arc<dyn ObjectStore>,
+  //     signer: Option<Arc<dyn object_store::signer::Signer>>,  // NEW
+  // }
+  //
+  // New constructor:
+  // pub fn new(store: Arc<dyn ObjectStore>, signer: Option<Arc<dyn object_store::signer::Signer>>) -> Self
+  //
+  // New method:
+  // pub async fn presign_xorb_url(&self, hash: &str, expiry: Duration) -> Result<Option<Url>, StorageError>
+  //   If signer is Some, generates presigned GET URL for xorbs/default/{hash}
+  //   If signer is None, returns None
+  string signer_field = 1;
+  string presign_method = 2;
+}
+
+// ─── StorageDispatch changes ─────────────────────────────────────────────────
+// File: crates/server/src/storage/dispatch.rs
+
+message StorageDispatchChanges {
+  // Add method:
+  // pub async fn presign_xorb_url(&self, hash: &str, expiry: Duration) -> Result<Option<Url>, StorageError>
+  //   StorageDispatch::Filesystem(_) => Ok(None)  (filesystem can't presign)
+  //   StorageDispatch::ObjectStore(b) => b.presign_xorb_url(hash, expiry)
+  string presign_dispatch = 1;
+}
+
+// ─── Builder changes ─────────────────────────────────────────────────────────
+// File: crates/server/src/storage/builder.rs
+
+message BuilderChanges {
+  // In the "s3" arm of build_storage():
+  //   After building the AmazonS3 store:
+  //   let store: AmazonS3 = builder.build()?;
+  //   let signer: Option<Arc<dyn Signer>> = if config.external_s3_url.is_some() {
+  //       Some(Arc::new(store.clone()) as Arc<dyn Signer>)  // AmazonS3 implements Signer
+  //   } else {
+  //       None
+  //   };
+  //   ObjectStoreBackend::new(Arc::new(store), signer)
+  //
+  // For non-S3 backends (gcs, azure, filesystem):
+  //   ObjectStoreBackend::new(Arc::new(store), None)
+  string s3_signer_construction = 1;
+}

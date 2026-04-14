@@ -1,4 +1,7 @@
+use std::time::Duration;
+
 use bytes::Bytes;
+use url::Url;
 
 use super::backend::StorageBackend;
 use super::error::StorageError;
@@ -12,6 +15,20 @@ use super::object_store_backend::ObjectStoreBackend;
 pub enum StorageDispatch {
     Filesystem(FilesystemBackend),
     ObjectStore(ObjectStoreBackend),
+}
+
+impl StorageDispatch {
+    /// Generate a presigned GET URL for a xorb, if the backend supports it.
+    pub async fn presign_xorb_url(
+        &self,
+        hash: &str,
+        expiry: Duration,
+    ) -> Result<Option<Url>, StorageError> {
+        match self {
+            Self::Filesystem(_) => Ok(None),
+            Self::ObjectStore(b) => b.presign_xorb_url(hash, expiry).await,
+        }
+    }
 }
 
 impl StorageBackend for StorageDispatch {

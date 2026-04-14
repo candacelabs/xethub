@@ -71,6 +71,47 @@ impl ChunkIndex for FilesystemChunkIndex {
 
         super::super::filesystem::atomic_write(&path, &json).await
     }
+
+    async fn put_batch(
+        &self,
+        entries: &[(String, ChunkLocation)],
+    ) -> Result<(), StorageError> {
+        for (chunk_hash, location) in entries {
+            self.put(chunk_hash, location.clone()).await?;
+        }
+        Ok(())
+    }
+
+    async fn get_by_xorb(&self, xorb_hash: &str) -> Result<Vec<(String, u32)>, StorageError> {
+        // Full directory scan — expensive but correct for filesystem backend
+        let mut results = Vec::new();
+        let mut read_dir = tokio::fs::read_dir(&self.dir)
+            .await
+            .map_err(|e| StorageError::io(e, &self.dir))?;
+
+        while let Some(entry) = read_dir
+            .next_entry()
+            .await
+            .map_err(|e| StorageError::io(e, &self.dir))?
+        {
+            let chunk_hash = entry.file_name().to_string_lossy().to_string();
+            if chunk_hash.starts_with('.') {
+                continue;
+            }
+            if let Ok(data) = tokio::fs::read(entry.path()).await {
+                if let Ok(locations) = serde_json::from_slice::<Vec<ChunkLocation>>(&data) {
+                    for loc in locations {
+                        if loc.xorb_hash == xorb_hash {
+                            results.push((chunk_hash.clone(), loc.chunk_index));
+                        }
+                    }
+                }
+            }
+        }
+
+        results.sort_by_key(|(_, idx)| *idx);
+        Ok(results)
+    }
 }
 
 #[cfg(test)]

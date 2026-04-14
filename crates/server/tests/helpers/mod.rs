@@ -23,6 +23,7 @@ use openxet_server::routes::build_router;
 use openxet_server::state::AppState;
 use openxet_server::storage::{
     FilesystemBackend, FilesystemChunkIndex, FilesystemFileIndex, StorageDispatch,
+    ChunkIndexDispatch, FileIndexDispatch, XorbMetadataIndexDispatch,
 };
 
 const TEST_SECRET: &str = "test-secret";
@@ -70,14 +71,22 @@ impl TestServer {
         let storage = Arc::new(StorageDispatch::Filesystem(
             FilesystemBackend::new(&data_dir).await.unwrap(),
         ));
-        let file_index = Arc::new(FilesystemFileIndex::new(&data_dir).await.unwrap());
-        let chunk_index = Arc::new(FilesystemChunkIndex::new(&data_dir).await.unwrap());
+        let file_index = Arc::new(FileIndexDispatch::Filesystem(
+            FilesystemFileIndex::new(&data_dir).await.unwrap(),
+        ));
+        let chunk_index = Arc::new(ChunkIndexDispatch::Filesystem(
+            FilesystemChunkIndex::new(&data_dir).await.unwrap(),
+        ));
+        let xorb_metadata_index = Arc::new(XorbMetadataIndexDispatch::Noop(
+            openxet_server::storage::NoopXorbMetadataIndex,
+        ));
         let upload_sessions = Arc::new(Mutex::new(HashMap::new()));
 
         let state = AppState {
             storage,
             file_index,
             chunk_index,
+            xorb_metadata_index,
             config: Arc::new(config),
             upload_sessions,
         };

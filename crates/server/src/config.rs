@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use serde::Deserialize;
 
 #[derive(Parser, Debug)]
@@ -10,17 +10,48 @@ pub struct Cli {
     #[arg(short, long, default_value = "openxet.toml")]
     pub config: PathBuf,
 
-    /// Host to bind to (overrides config)
-    #[arg(long)]
-    pub host: Option<String>,
+    #[command(subcommand)]
+    pub command: Option<Command>,
+}
 
-    /// Port to bind to (overrides config)
-    #[arg(short, long)]
-    pub port: Option<u16>,
+#[derive(Subcommand, Debug)]
+pub enum Command {
+    /// Run the CAS server (default when no subcommand given)
+    Serve {
+        /// Host to bind to (overrides config)
+        #[arg(long)]
+        host: Option<String>,
 
-    /// Data directory (overrides config)
-    #[arg(long)]
-    pub data_dir: Option<PathBuf>,
+        /// Port to bind to (overrides config)
+        #[arg(short, long)]
+        port: Option<u16>,
+
+        /// Data directory (overrides config)
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
+
+    /// Rebuild indexes from stored xorbs and shards
+    RebuildIndex {
+        /// Data directory (overrides config)
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
+
+    /// Generate a JWT token for API access
+    GenerateToken {
+        /// Token scope: "read" or "write"
+        #[arg(long, default_value = "write")]
+        scope: String,
+
+        /// Repository pattern the token grants access to
+        #[arg(long, default_value = "*")]
+        repo: String,
+
+        /// Token expiry in seconds
+        #[arg(long, default_value = "86400")]
+        expiry: u64,
+    },
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -61,6 +92,16 @@ pub struct StorageConfig {
     pub azure_container: Option<String>,
     pub azure_account: Option<String>,
     pub azure_access_key: Option<String>,
+
+    /// Which index backend to use: "sqlite" or "filesystem"
+    pub index_backend: String,
+
+    /// Presigned URL expiry in seconds (default: 3600)
+    pub presigned_url_expiry_seconds: u64,
+
+    /// External S3 URL that clients can reach directly (for presigned URLs)
+    /// Example: "http://minio.example.com:9000"
+    pub external_s3_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -96,6 +137,9 @@ impl Default for StorageConfig {
             azure_container: None,
             azure_account: None,
             azure_access_key: None,
+            index_backend: "sqlite".to_string(),
+            presigned_url_expiry_seconds: 3600,
+            external_s3_url: None,
         }
     }
 }
@@ -120,15 +164,31 @@ impl AppConfig {
             AppConfig::default()
         };
 
-        // CLI overrides
-        if let Some(host) = &cli.host {
-            config.server.host = host.clone();
-        }
-        if let Some(port) = cli.port {
-            config.server.port = port;
-        }
-        if let Some(data_dir) = &cli.data_dir {
-            config.storage.data_dir = data_dir.clone();
+        // CLI overrides depend on subcommand
+        if let Some(ref cmd) = cli.command {
+            match cmd {
+                Command::Serve {
+                    host,
+                    port,
+                    data_dir,
+                } => {
+                    if let Some(h) = host {
+                        config.server.host = h.clone();
+                    }
+                    if let Some(p) = port {
+                        config.server.port = *p;
+                    }
+                    if let Some(d) = data_dir {
+                        config.storage.data_dir = d.clone();
+                    }
+                }
+                Command::RebuildIndex { data_dir } => {
+                    if let Some(d) = data_dir {
+                        config.storage.data_dir = d.clone();
+                    }
+                }
+                Command::GenerateToken { .. } => {}
+            }
         }
 
         // Environment variable overrides (highest priority)
@@ -188,6 +248,17 @@ impl AppConfig {
         }
         if let Ok(v) = std::env::var("OPENXET_AZURE_ACCESS_KEY") {
             self.storage.azure_access_key = Some(v);
+        }
+        if let Ok(v) = std::env::var("OPENXET_INDEX_BACKEND") {
+            self.storage.index_backend = v;
+        }
+        if let Ok(v) = std::env::var("OPENXET_PRESIGNED_URL_EXPIRY")
+            && let Ok(v) = v.parse::<u64>()
+        {
+            self.storage.presigned_url_expiry_seconds = v;
+        }
+        if let Ok(v) = std::env::var("OPENXET_EXTERNAL_S3_URL") {
+            self.storage.external_s3_url = Some(v);
         }
         if let Ok(secret) = std::env::var("OPENXET_AUTH_SECRET") {
             self.auth.secret = secret;

@@ -1,0 +1,116 @@
+// spec/contracts/index_traits.proto
+//
+// Typed contracts for agent A3 (SQLite Index Implementation).
+// Describes the Rust traits, structs, and dispatch enums A3 produces.
+// Downstream agents (A5, A6-A10) consume these types.
+
+syntax = "proto3";
+package openxet.agent.index;
+
+// ─── Trait: ChunkIndex (extended) ────────────────────────────────────────────
+// File: crates/server/src/storage/index/mod.rs
+// A3 adds two new methods to the existing ChunkIndex trait.
+
+message ChunkIndexTrait {
+  // Existing methods (unchanged):
+  // async fn get(&self, chunk_hash: &str) -> Result<Vec<ChunkLocation>, StorageError>
+  // async fn put(&self, chunk_hash: &str, location: ChunkLocation) -> Result<(), StorageError>
+
+  // NEW: Bulk insert multiple chunk→location mappings in a single transaction.
+  // Filesystem impl: loops over individual put() calls.
+  // SQLite impl: wraps in BEGIN/COMMIT.
+  string put_batch_signature = 1; // async fn put_batch(&self, entries: &[(String, ChunkLocation)]) -> Result<(), StorageError>
+
+  // NEW: Reverse lookup — all chunks in a given xorb.
+  // Returns Vec<(chunk_hash_hex, chunk_index)> sorted by chunk_index.
+  // Filesystem impl: full directory scan + JSON parse + filter.
+  // SQLite impl: SELECT chunk_hash, chunk_index FROM chunks WHERE xorb_hash = ? ORDER BY chunk_index
+  string get_by_xorb_signature = 2; // async fn get_by_xorb(&self, xorb_hash: &str) -> Result<Vec<(String, u32)>, StorageError>
+}
+
+// ─── Trait: FileIndex (extended) ─────────────────────────────────────────────
+
+message FileIndexTrait {
+  // Existing methods (unchanged):
+  // async fn get(&self, file_hash: &str) -> Result<Option<String>, StorageError>
+  // async fn put(&self, file_hash: &str, shard_hash: &str) -> Result<(), StorageError>
+  // async fn list_all(&self) -> Result<Vec<(String, String)>, StorageError>
+
+  // NEW: Bulk insert multiple file→shard mappings.
+  string put_batch_signature = 1; // async fn put_batch(&self, entries: &[(String, String)]) -> Result<(), StorageError>
+}
+
+// ─── Trait: XorbMetadataIndex (new) ──────────────────────────────────────────
+// File: crates/server/src/storage/index/xorb_metadata.rs
+
+message XorbMetadataIndexTrait {
+  // Get all chunk metadata for a xorb, ordered by chunk_index.
+  string get_signature = 1; // async fn get(&self, xorb_hash: &str) -> Result<Vec<XorbChunkMetadata>, StorageError>
+
+  // Store metadata for all chunks in a xorb (bulk, transactional).
+  string put_signature = 2; // async fn put(&self, xorb_hash: &str, metadata: &[XorbChunkMetadata]) -> Result<(), StorageError>
+
+  // Check if metadata exists for a xorb.
+  string exists_signature = 3; // async fn exists(&self, xorb_hash: &str) -> Result<bool, StorageError>
+}
+
+message XorbChunkMetadata {
+  uint32 chunk_index = 1;
+  string chunk_hash = 2;              // 64-char hex
+  int64 compressed_offset_start = 3;  // byte position in xorb binary
+  int64 compressed_offset_end = 4;    // byte position in xorb binary (exclusive)
+  int64 uncompressed_offset = 5;      // cumulative uncompressed byte offset
+  int64 uncompressed_size = 6;        // uncompressed chunk size
+}
+
+// ─── Dispatch Enums ──────────────────────────────────────────────────────────
+// File: crates/server/src/storage/index/dispatch.rs
+
+message FileIndexDispatch {
+  // enum FileIndexDispatch { Filesystem(FilesystemFileIndex), Sqlite(SqliteFileIndex) }
+  // Implements FileIndex trait via delegation.
+  repeated string variants = 1; // ["Filesystem", "Sqlite"]
+}
+
+message ChunkIndexDispatch {
+  // enum ChunkIndexDispatch { Filesystem(FilesystemChunkIndex), Sqlite(SqliteChunkIndex) }
+  // Implements ChunkIndex trait via delegation.
+  repeated string variants = 1; // ["Filesystem", "Sqlite"]
+}
+
+message XorbMetadataIndexDispatch {
+  // enum XorbMetadataIndexDispatch { Noop(NoopXorbMetadataIndex), Sqlite(SqliteXorbMetadataIndex) }
+  // Filesystem mode uses Noop (no xorb metadata, falls back to parsing xorbs).
+  repeated string variants = 1; // ["Noop", "Sqlite"]
+}
+
+// ─── SQLite Implementations ──────────────────────────────────────────────────
+// File: crates/server/src/storage/index/sqlite.rs
+
+message SqliteFileIndex {
+  // pub struct SqliteFileIndex { conn: tokio::sync::Mutex<rusqlite::Connection> }
+  // Constructor: pub async fn new(db_path: &Path) -> Result<Self, StorageError>
+  //   Creates table: files(file_hash TEXT PRIMARY KEY, shard_hash TEXT NOT NULL)
+  // Implements FileIndex trait.
+  string db_path_param = 1;
+  string table_schema = 2; // "files(file_hash TEXT PRIMARY KEY, shard_hash TEXT NOT NULL)"
+}
+
+message SqliteChunkIndex {
+  // pub struct SqliteChunkIndex { conn: tokio::sync::Mutex<rusqlite::Connection> }
+  // Constructor: pub async fn new(db_path: &Path) -> Result<Self, StorageError>
+  //   Creates table: chunks(chunk_hash TEXT, xorb_hash TEXT, chunk_index INTEGER, PRIMARY KEY(chunk_hash, xorb_hash, chunk_index))
+  //   Creates index: CREATE INDEX IF NOT EXISTS idx_chunks_xorb ON chunks(xorb_hash)
+  // Implements ChunkIndex trait.
+  string db_path_param = 1;
+  string table_schema = 2; // "chunks(chunk_hash TEXT, xorb_hash TEXT, chunk_index INTEGER, PRIMARY KEY(chunk_hash, xorb_hash, chunk_index))"
+}
+
+message SqliteXorbMetadataIndex {
+  // pub struct SqliteXorbMetadataIndex { conn: tokio::sync::Mutex<rusqlite::Connection> }
+  // Constructor: pub async fn new(db_path: &Path) -> Result<Self, StorageError>
+  //   Creates table: xorb_metadata(xorb_hash TEXT, chunk_index INTEGER, chunk_hash TEXT, ...)
+  // Implements XorbMetadataIndex trait.
+  string db_path_param = 1;
+  string table_schema = 2;
+}

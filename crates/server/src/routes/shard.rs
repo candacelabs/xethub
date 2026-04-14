@@ -88,31 +88,36 @@ pub async fn post_shard(
     // Store the shard
     let was_inserted = state.storage.put_shard(&shard_hash_hex, body).await?;
 
-    // Index file hashes
-    for file_block in &shard.file_info_blocks {
-        let file_hash_hex = file_block.header.file_hash.to_hex();
-        state
-            .file_index
-            .put(&file_hash_hex, &shard_hash_hex)
-            .await?;
-    }
+    // Batch index file hashes
+    let file_entries: Vec<(String, String)> = shard
+        .file_info_blocks
+        .iter()
+        .map(|fb| (fb.header.file_hash.to_hex(), shard_hash_hex.clone()))
+        .collect();
+    state.file_index.put_batch(&file_entries).await?;
 
-    // Index chunk hashes from CAS info section
-    for cas_block in &shard.cas_info_blocks {
-        let xorb_hash_hex = cas_block.header.cas_hash.to_hex();
-        for (i, entry) in cas_block.entries.iter().enumerate() {
-            state
-                .chunk_index
-                .put(
-                    &entry.chunk_hash.to_hex(),
-                    ChunkLocation {
-                        xorb_hash: xorb_hash_hex.clone(),
-                        chunk_index: i as u32,
-                    },
-                )
-                .await?;
-        }
-    }
+    // Batch index chunk hashes from CAS info section
+    let chunk_entries: Vec<(String, ChunkLocation)> = shard
+        .cas_info_blocks
+        .iter()
+        .flat_map(|cas_block| {
+            let xorb_hash_hex = cas_block.header.cas_hash.to_hex();
+            cas_block
+                .entries
+                .iter()
+                .enumerate()
+                .map(move |(i, entry)| {
+                    (
+                        entry.chunk_hash.to_hex(),
+                        ChunkLocation {
+                            xorb_hash: xorb_hash_hex.clone(),
+                            chunk_index: i as u32,
+                        },
+                    )
+                })
+        })
+        .collect();
+    state.chunk_index.put_batch(&chunk_entries).await?;
 
     Ok(Json(ShardUploadResponse {
         result: if was_inserted { 1 } else { 0 },

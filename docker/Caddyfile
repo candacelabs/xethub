@@ -1,0 +1,22 @@
+# Caddy reverse proxy configuration for OpenXet
+#
+# For production, replace :80 with your domain name to enable automatic HTTPS:
+#   xet.example.com {
+#       ...
+#   }
+
+:80 {
+    # OpenXet CAS API and frontend
+    reverse_proxy openxet:8080
+
+    # MinIO API (for presigned URL downloads)
+    handle_path /s3/* {
+        reverse_proxy minio:9000
+    }
+
+    # Request logging
+    log {
+        output stdout
+        format console
+    }
+}

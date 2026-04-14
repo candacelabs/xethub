@@ -1,0 +1,66 @@
+// spec/contracts/config.proto
+//
+// Typed contracts for agent A0 (Config & Dependencies).
+// Describes new fields added to StorageConfig and Cli.
+
+syntax = "proto3";
+package openxet.agent.config;
+
+// ─── StorageConfig additions ─────────────────────────────────────────────────
+// File: crates/server/src/config.rs
+
+message StorageConfigAdditions {
+  // New field: which index backend to use.
+  // Type: Option<String> (defaults to "sqlite" in Default impl)
+  // Env var: OPENXET_INDEX_BACKEND
+  string index_backend = 1; // "sqlite" | "filesystem", default "sqlite"
+
+  // New field: presigned URL expiry in seconds.
+  // Type: u64, default 3600
+  // Env var: OPENXET_PRESIGNED_URL_EXPIRY
+  uint64 presigned_url_expiry_seconds = 2;
+
+  // New field: external S3 URL that clients can reach.
+  // Type: Option<String>, default None
+  // Env var: OPENXET_EXTERNAL_S3_URL
+  // Example: "http://minio.example.com:9000"
+  // When set, presigned URLs use this base. When None, presigned URLs are disabled.
+  string external_s3_url = 3;
+}
+
+// ─── Cargo.toml additions ────────────────────────────────────────────────────
+// File: crates/server/Cargo.toml
+
+message CargoDepsAdditions {
+  // rusqlite with bundled SQLite (avoids system lib dependency in Docker)
+  string rusqlite = 1; // rusqlite = { version = "0.32", features = ["bundled"] }
+
+  // clap needs "derive" feature (already present) + add subcommand support
+  // Already has: clap = { version = "4", features = ["derive"] }
+  // No change needed — clap derive already supports subcommands.
+}
+
+// ─── Cli subcommand structure ────────────────────────────────────────────────
+// File: crates/server/src/config.rs
+
+message CliStructure {
+  // Transform Cli from flat struct to subcommand-based:
+  //
+  // #[derive(Parser)]
+  // pub struct Cli {
+  //     #[arg(short, long, default_value = "openxet.toml")]
+  //     pub config: PathBuf,
+  //     #[command(subcommand)]
+  //     pub command: Option<Command>,
+  // }
+  //
+  // #[derive(Subcommand)]
+  // pub enum Command {
+  //     Serve { #[arg(long)] host: Option<String>, #[arg(short, long)] port: Option<u16>, ... },
+  //     RebuildIndex { #[arg(long)] data_dir: Option<PathBuf> },
+  //     GenerateToken { #[arg(long, default_value = "write")] scope: String, #[arg(long, default_value = "*")] repo: String, #[arg(long, default_value = "86400")] expiry: u64 },
+  // }
+  //
+  // Default command (None) = Serve behavior (backward compatible)
+  repeated string subcommands = 1; // ["serve", "rebuild-index", "generate-token"]
+}

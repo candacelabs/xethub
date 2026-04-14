@@ -1,12 +1,18 @@
 pub mod chunk_index;
+pub mod dispatch;
 pub mod file_index;
+pub mod sqlite;
+pub mod xorb_metadata;
 
 use serde::{Deserialize, Serialize};
 
 use super::error::StorageError;
 
 pub use chunk_index::FilesystemChunkIndex;
+pub use dispatch::{ChunkIndexDispatch, FileIndexDispatch, XorbMetadataIndexDispatch};
 pub use file_index::FilesystemFileIndex;
+pub use sqlite::{SqliteChunkIndex, SqliteFileIndex, SqliteXorbMetadataIndex};
+pub use xorb_metadata::{NoopXorbMetadataIndex, XorbChunkMetadata, XorbMetadataIndex};
 
 /// A location where a chunk can be found: which xorb and at what index within it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -34,6 +40,12 @@ pub trait FileIndex: Send + Sync {
         shard_hash: &str,
     ) -> impl Future<Output = Result<(), StorageError>> + Send;
 
+    /// Bulk insert file→shard mappings. Default: loops over put().
+    fn put_batch(
+        &self,
+        entries: &[(String, String)],
+    ) -> impl Future<Output = Result<(), StorageError>> + Send;
+
     /// List all file index entries as (file_hash, shard_hash) pairs.
     fn list_all(&self) -> impl Future<Output = Result<Vec<(String, String)>, StorageError>> + Send;
 }
@@ -57,4 +69,16 @@ pub trait ChunkIndex: Send + Sync {
         chunk_hash: &str,
         location: ChunkLocation,
     ) -> impl Future<Output = Result<(), StorageError>> + Send;
+
+    /// Bulk insert chunk→location mappings. Default: loops over put().
+    fn put_batch(
+        &self,
+        entries: &[(String, ChunkLocation)],
+    ) -> impl Future<Output = Result<(), StorageError>> + Send;
+
+    /// Reverse lookup: all chunks in a given xorb, sorted by chunk_index.
+    fn get_by_xorb(
+        &self,
+        xorb_hash: &str,
+    ) -> impl Future<Output = Result<Vec<(String, u32)>, StorageError>> + Send;
 }

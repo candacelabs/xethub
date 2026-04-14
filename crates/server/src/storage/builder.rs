@@ -4,6 +4,7 @@ use anyhow::{Context, bail};
 use object_store::aws::AmazonS3Builder;
 use object_store::azure::MicrosoftAzureBuilder;
 use object_store::gcp::GoogleCloudStorageBuilder;
+use object_store::signer::Signer;
 
 use crate::config::StorageConfig;
 
@@ -45,8 +46,11 @@ pub async fn build_storage(config: &StorageConfig) -> anyhow::Result<StorageDisp
             }
 
             let store = builder.build().context("failed to build S3 client")?;
+            // AmazonS3 implements Signer — clone one copy for presigned URL generation.
+            let signer: Option<Arc<dyn Signer>> = Some(Arc::new(store.clone()));
             Ok(StorageDispatch::ObjectStore(ObjectStoreBackend::new(
                 Arc::new(store),
+                signer,
             )))
         }
         "gcs" => {
@@ -64,6 +68,7 @@ pub async fn build_storage(config: &StorageConfig) -> anyhow::Result<StorageDisp
             let store = builder.build().context("failed to build GCS client")?;
             Ok(StorageDispatch::ObjectStore(ObjectStoreBackend::new(
                 Arc::new(store),
+                None,
             )))
         }
         "azure" => {
@@ -84,6 +89,7 @@ pub async fn build_storage(config: &StorageConfig) -> anyhow::Result<StorageDisp
             let store = builder.build().context("failed to build Azure client")?;
             Ok(StorageDispatch::ObjectStore(ObjectStoreBackend::new(
                 Arc::new(store),
+                None,
             )))
         }
         other => bail!("unknown storage backend: {other}"),

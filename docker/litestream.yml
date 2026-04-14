@@ -1,0 +1,18 @@
+# Litestream configuration for continuous SQLite replication to MinIO
+#
+# This replicates the OpenXet index database to a MinIO bucket.
+# If the server dies, restore with:
+#   litestream restore -o /data/index.db s3://litestream/index.db
+
+dbs:
+  - path: /data/index.db
+    replicas:
+      - type: s3
+        bucket: litestream
+        path: index.db
+        endpoint: http://minio:9000
+        force-path-style: true
+        skip-verify: true
+        sync-interval: 1s
+        retention: 72h
+        retention-check-interval: 1h

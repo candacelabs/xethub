@@ -6,7 +6,9 @@ use std::time::Instant;
 use tokio::sync::Mutex;
 
 use crate::config::AppConfig;
-use crate::storage::{FilesystemChunkIndex, FilesystemFileIndex, StorageDispatch};
+use crate::storage::{
+    ChunkIndexDispatch, FileIndexDispatch, StorageDispatch, XorbMetadataIndexDispatch,
+};
 
 /// State for an in-progress multipart upload session.
 pub struct UploadSession {
@@ -20,8 +22,9 @@ pub struct UploadSession {
 #[derive(Clone)]
 pub struct AppState {
     pub storage: Arc<StorageDispatch>,
-    pub file_index: Arc<FilesystemFileIndex>,
-    pub chunk_index: Arc<FilesystemChunkIndex>,
+    pub file_index: Arc<FileIndexDispatch>,
+    pub chunk_index: Arc<ChunkIndexDispatch>,
+    pub xorb_metadata_index: Arc<XorbMetadataIndexDispatch>,
     pub config: Arc<AppConfig>,
     pub upload_sessions: Arc<Mutex<HashMap<String, UploadSession>>>,
 }

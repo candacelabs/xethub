@@ -17,7 +17,7 @@ use openxet_hashing::MerkleHash;
 use crate::auth::RequireRead;
 use crate::error::AppError;
 use crate::state::AppState;
-use crate::storage::{ChunkIndex, StorageBackend, validate_hash};
+use crate::storage::{ChunkIndex, StorageBackend, XorbMetadataIndex, validate_hash};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -97,8 +97,31 @@ pub async fn get_dedup(
     let mut cas_info_blocks = Vec::new();
 
     for xorb_hash_hex in xorb_map.keys() {
-        let xorb_data = state.storage.get_xorb(xorb_hash_hex).await?;
-        let chunk_info = parse_xorb_chunk_hashes(&xorb_data);
+        // Fast path: use cached xorb metadata (avoids S3 fetch + decompression)
+        let metadata = state.xorb_metadata_index.get(xorb_hash_hex).await?;
+
+        let (chunk_info, xorb_size) = if !metadata.is_empty() {
+            let info: Vec<(MerkleHash, u32, u32)> = metadata
+                .iter()
+                .map(|m| {
+                    let hash = MerkleHash::from_hex(&m.chunk_hash)
+                        .unwrap_or_else(|_| MerkleHash::from_bytes([0u8; 32]));
+                    (hash, m.uncompressed_offset as u32, m.uncompressed_size as u32)
+                })
+                .collect();
+            // Estimate on-disk size from last chunk's compressed end
+            let disk_size = metadata
+                .last()
+                .map(|m| m.compressed_offset_end as u32)
+                .unwrap_or(0);
+            (info, disk_size)
+        } else {
+            // Slow path: parse xorb from storage (filesystem mode fallback)
+            let xorb_data = state.storage.get_xorb(xorb_hash_hex).await?;
+            let info = parse_xorb_chunk_hashes(&xorb_data);
+            let size = xorb_data.len() as u32;
+            (info, size)
+        };
 
         let xorb_hash = MerkleHash::from_hex(xorb_hash_hex)
             .map_err(|e| AppError::Internal(anyhow::anyhow!("bad stored hash: {e}")))?;
@@ -120,7 +143,7 @@ pub async fn get_dedup(
                 cas_flags: 0,
                 num_entries: entries.len() as u32,
                 num_bytes_in_cas: total_uncompressed,
-                num_bytes_on_disk: xorb_data.len() as u32,
+                num_bytes_on_disk: xorb_size,
             },
             entries,
         });

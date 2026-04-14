@@ -1,0 +1,108 @@
+# Self-hosted OpenXet deployment with MinIO, Litestream, and Caddy
+#
+# Usage:
+#   docker compose -f docker/compose.selfhost.yaml up -d
+#
+# This sets up:
+#   - MinIO: S3-compatible object storage for xorbs and shards
+#   - OpenXet: CAS server with SQLite indexes
+#   - Litestream: Continuous SQLite replication to MinIO
+#   - Caddy: Reverse proxy with automatic HTTPS
+
+services:
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 $${MINIO_ROOT_USER:-minioadmin} $${MINIO_ROOT_PASSWORD:-minioadmin};
+      mc mb --ignore-existing local/openxet;
+      mc mb --ignore-existing local/litestream;
+      exit 0;
+      "
+
+  openxet:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+    volumes:
+      - openxet-data:/data
+    environment:
+      OPENXET_HOST: "0.0.0.0"
+      OPENXET_PORT: "8080"
+      OPENXET_DATA_DIR: /data
+      OPENXET_AUTH_SECRET: ${OPENXET_AUTH_SECRET:-change-me-in-production}
+      OPENXET_STORAGE_BACKEND: s3
+      OPENXET_INDEX_BACKEND: sqlite
+      OPENXET_S3_BUCKET: openxet
+      OPENXET_S3_REGION: us-east-1
+      OPENXET_S3_ENDPOINT: http://minio:9000
+      OPENXET_S3_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      OPENXET_S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      OPENXET_S3_ALLOW_HTTP: "true"
+      OPENXET_EXTERNAL_S3_URL: ${OPENXET_EXTERNAL_S3_URL:-http://localhost:9000}
+      OPENXET_PRESIGNED_URL_EXPIRY: "3600"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/api/stats"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+  litestream:
+    image: litestream/litestream:latest
+    depends_on:
+      openxet:
+        condition: service_healthy
+    volumes:
+      - openxet-data:/data
+      - ./litestream.yml:/etc/litestream.yml:ro
+    command: replicate
+    environment:
+      LITESTREAM_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      LITESTREAM_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      openxet:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  minio-data:
+  openxet-data:
+  caddy-data:
+  caddy-config:

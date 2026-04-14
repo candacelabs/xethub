@@ -1,0 +1,55 @@
+// spec/contracts/state.proto
+//
+// Typed contracts for agent A5 (State + Main + CLI).
+// Describes the updated AppState and main.rs structure.
+
+syntax = "proto3";
+package openxet.agent.state;
+
+// ─── AppState changes ────────────────────────────────────────────────────────
+// File: crates/server/src/state.rs
+
+message AppStateChanges {
+  // Replace concrete index types with dispatch types:
+  //
+  // #[derive(Clone)]
+  // pub struct AppState {
+  //     pub storage: Arc<StorageDispatch>,
+  //     pub file_index: Arc<FileIndexDispatch>,         // was: Arc<FilesystemFileIndex>
+  //     pub chunk_index: Arc<ChunkIndexDispatch>,        // was: Arc<FilesystemChunkIndex>
+  //     pub xorb_metadata_index: Arc<XorbMetadataIndexDispatch>,  // NEW
+  //     pub config: Arc<AppConfig>,
+  //     pub upload_sessions: Arc<Mutex<HashMap<String, UploadSession>>>,
+  // }
+  repeated string fields = 1;
+}
+
+// ─── main.rs changes ─────────────────────────────────────────────────────────
+// File: crates/server/src/main.rs
+
+message MainChanges {
+  // 1. Parse CLI with subcommands
+  // 2. Match on command:
+  //    - None | Some(Command::Serve { .. }) => run_server(config)
+  //    - Some(Command::RebuildIndex { .. }) => rebuild::run_rebuild(config)
+  //    - Some(Command::GenerateToken { scope, repo, expiry }) => generate_token(config, scope, repo, expiry)
+  //
+  // 3. Index initialization based on config.storage.index_backend:
+  //    "sqlite" => {
+  //        let db_path = config.data_dir().join("index.db");
+  //        let file_index = Arc::new(FileIndexDispatch::Sqlite(SqliteFileIndex::new(&db_path).await?));
+  //        let chunk_index = Arc::new(ChunkIndexDispatch::Sqlite(SqliteChunkIndex::new(&db_path).await?));
+  //        let xorb_meta = Arc::new(XorbMetadataIndexDispatch::Sqlite(SqliteXorbMetadataIndex::new(&db_path).await?));
+  //    }
+  //    "filesystem" | _ => {
+  //        let file_index = Arc::new(FileIndexDispatch::Filesystem(FilesystemFileIndex::new(data_dir).await?));
+  //        let chunk_index = Arc::new(ChunkIndexDispatch::Filesystem(FilesystemChunkIndex::new(data_dir).await?));
+  //        let xorb_meta = Arc::new(XorbMetadataIndexDispatch::Noop(NoopXorbMetadataIndex));
+  //    }
+  //
+  // IMPORTANT: All three SQLite indexes share the SAME database file (index.db)
+  // but use separate rusqlite::Connection instances (each wrapped in Mutex).
+  // This is fine — SQLite WAL mode supports concurrent readers + one writer.
+  // Each constructor calls: PRAGMA journal_mode=WAL;
+  string initialization = 1;
+}

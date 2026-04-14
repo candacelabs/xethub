@@ -40,6 +40,13 @@ impl FileIndex for FilesystemFileIndex {
         super::super::filesystem::atomic_write(&path, shard_hash.as_bytes()).await
     }
 
+    async fn put_batch(&self, entries: &[(String, String)]) -> Result<(), StorageError> {
+        for (file_hash, shard_hash) in entries {
+            self.put(file_hash, shard_hash).await?;
+        }
+        Ok(())
+    }
+
     async fn list_all(&self) -> Result<Vec<(String, String)>, StorageError> {
         let mut entries = Vec::new();
         let mut read_dir = tokio::fs::read_dir(&self.dir)

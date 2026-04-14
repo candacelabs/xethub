@@ -1,9 +1,12 @@
 use std::ops::Range;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use object_store::ObjectStore;
 use object_store::path::Path as ObjectPath;
+use object_store::signer::Signer;
+use url::Url;
 
 use super::backend::{StorageBackend, validate_hash};
 use super::error::StorageError;
@@ -20,11 +23,33 @@ use super::error::StorageError;
 /// ```
 pub struct ObjectStoreBackend {
     store: Arc<dyn ObjectStore>,
+    signer: Option<Arc<dyn Signer>>,
 }
 
 impl ObjectStoreBackend {
-    pub fn new(store: Arc<dyn ObjectStore>) -> Self {
-        Self { store }
+    pub fn new(store: Arc<dyn ObjectStore>, signer: Option<Arc<dyn Signer>>) -> Self {
+        Self { store, signer }
+    }
+
+    /// Generate a presigned GET URL for a xorb.
+    /// Returns `None` if no signer is configured (e.g. filesystem backend).
+    pub async fn presign_xorb_url(
+        &self,
+        hash: &str,
+        expiry: Duration,
+    ) -> Result<Option<Url>, StorageError> {
+        validate_hash(hash)?;
+        match &self.signer {
+            Some(signer) => {
+                let path = Self::xorb_path(hash);
+                let url = signer
+                    .signed_url(reqwest::Method::GET, &path, expiry)
+                    .await
+                    .map_err(|e| StorageError::ObjectStore(format!("presign error: {e}")))?;
+                Ok(Some(url))
+            }
+            None => Ok(None),
+        }
     }
 
     fn xorb_path(hash: &str) -> ObjectPath {
@@ -157,7 +182,7 @@ mod tests {
     const TEST_HASH_2: &str = "b1b2c3d4e5f60708091011121314151617181920212223242526272829303132";
 
     fn make_backend() -> ObjectStoreBackend {
-        ObjectStoreBackend::new(Arc::new(InMemory::new()))
+        ObjectStoreBackend::new(Arc::new(InMemory::new()), None)
     }
 
     #[tokio::test]

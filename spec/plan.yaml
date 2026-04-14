@@ -1,0 +1,2374 @@
+# spec/plan.yaml
+#
+# Canonical DAG for OpenXet Self-Hosted CAS Server
+# 11 agents across 4 levels. Critical path: A0 → A3 → A5 → A6|A7|A8|A9|A10
+#
+# To execute: read this file, launch worker agents by level (level 0 first, in parallel),
+# gate on `cargo test` passing before advancing to the next level.
+
+project:
+  name: "OpenXet Self-Hosted CAS Server"
+  description: >
+    Make OpenXet production-ready for self-hosted deployment: SQLite indexes for scale,
+    presigned URL downloads, LFS transfer agent for transparent git integration,
+    and Docker Compose for one-command deployment.
+  repository: /home/u_kaashs/workspace/openxet
+  tech_stack:
+    language: Rust (edition 2024)
+    runtime: tokio
+    http: axum 0.8
+    storage: object_store 0.11 (S3/GCS/Azure)
+    database: rusqlite (bundled SQLite)
+    cli: clap 4 (derive)
+    config: TOML + env var overrides
+    containers: Docker Compose + MinIO + Litestream + Caddy
+  build_commands:
+    build: "cargo build"
+    test: "cargo test"
+    lint: "cargo clippy"
+    format_check: "cargo fmt --check"
+  gate_command: "cargo test"
+
+# ─── Dispatch Table ───────────────────────────────────────────────────────────
+
+dispatch_table:
+  - level: 0
+    agents: [A0, A1, A2]
+    parallelism: 3
+    blocked_by: nothing
+    gate: "cargo build && cargo test"
+  - level: 1
+    agents: [A3, A4]
+    parallelism: 2
+    blocked_by: [A0]
+    gate: "cargo build && cargo test"
+  - level: 2
+    agents: [A5]
+    parallelism: 1
+    blocked_by: [A3, A4]
+    gate: "cargo build && cargo test"
+  - level: 3
+    agents: [A6, A7, A8, A9, A10]
+    parallelism: 5
+    blocked_by: [A5]
+    gate: "cargo build && cargo test && cargo clippy"
+
+# ─── DAG Nodes ────────────────────────────────────────────────────────────────
+
+agents:
+
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # LEVEL 0 — Foundation (no dependencies)
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  - id: A0
+    name: config_and_deps
+    level: 0
+    depends_on: []
+    input_protos: []
+    output_protos: [StorageConfigAdditions, CargoDepsAdditions, CliStructure]
+    reads:
+      - crates/server/src/config.rs
+      - crates/server/Cargo.toml
+    writes:
+      - crates/server/src/config.rs
+      - crates/server/Cargo.toml
+    test_glob: "crates/server/src/config.rs"
+    agent_prompt: |
+      # Agent A0: Config & Dependencies
+
+      You are modifying two files in the OpenXet CAS server to add configuration fields
+      and dependencies needed by downstream agents.
+
+      ## Context
+
+      OpenXet is a Rust workspace (edition 2024) with a server crate at `crates/server/`.
+      The server uses TOML config with env var overrides. See `CLAUDE.md` for full details.
+
+      ## Task 1: Add rusqlite dependency
+
+      File: `crates/server/Cargo.toml`
+
+      Add to `[dependencies]`:
+      ```toml
+      rusqlite = { version = "0.32", features = ["bundled"] }
+      ```
+
+      The `bundled` feature compiles SQLite from source, avoiding system library
+      dependencies in Docker. This is critical for reproducible builds.
+
+      ## Task 2: Add config fields to StorageConfig
+
+      File: `crates/server/src/config.rs`
+
+      Add three fields to `StorageConfig`:
+
+      ```rust
+      /// Which index backend to use: "sqlite" or "filesystem"
+      pub index_backend: String,
+
+      /// Presigned URL expiry in seconds (default 3600 = 1 hour)
+      pub presigned_url_expiry_seconds: u64,
+
+      /// External S3 URL for presigned URLs (e.g., "http://minio:9000").
+      /// When set, clients download xorbs directly from S3 via presigned URLs.
+      /// When None, server proxies all downloads.
+      pub external_s3_url: Option<String>,
+      ```
+
+      Update `Default for StorageConfig`:
+      ```rust
+      index_backend: "sqlite".to_string(),
+      presigned_url_expiry_seconds: 3600,
+      external_s3_url: None,
+      ```
+
+      Add env var overrides in `apply_env_overrides()`:
+      ```rust
+      if let Ok(v) = std::env::var("OPENXET_INDEX_BACKEND") {
+          self.storage.index_backend = v;
+      }
+      if let Ok(v) = std::env::var("OPENXET_PRESIGNED_URL_EXPIRY")
+          && let Ok(v) = v.parse::<u64>()
+      {
+          self.storage.presigned_url_expiry_seconds = v;
+      }
+      if let Ok(v) = std::env::var("OPENXET_EXTERNAL_S3_URL") {
+          self.storage.external_s3_url = Some(v);
+      }
+      ```
+
+      ## Task 3: Add CLI subcommand structure
+
+      File: `crates/server/src/config.rs`
+
+      Transform the `Cli` struct to support subcommands while maintaining backward compatibility
+      (running without a subcommand = `serve` behavior).
+
+      ```rust
+      use clap::{Parser, Subcommand};
+
+      #[derive(Parser, Debug)]
+      #[command(name = "openxet-server", about = "OpenXet CAS server")]
+      pub struct Cli {
+          /// Path to the configuration file
+          #[arg(short, long, default_value = "openxet.toml", global = true)]
+          pub config: PathBuf,
+
+          #[command(subcommand)]
+          pub command: Option<Command>,
+      }
+
+      #[derive(Subcommand, Debug)]
+      pub enum Command {
+          /// Run the HTTP server (default if no subcommand given)
+          Serve {
+              /// Host to bind to (overrides config)
+              #[arg(long)]
+              host: Option<String>,
+              /// Port to bind to (overrides config)
+              #[arg(short, long)]
+              port: Option<u16>,
+              /// Data directory (overrides config)
+              #[arg(long)]
+              data_dir: Option<PathBuf>,
+          },
+          /// Rebuild indexes from S3/storage data
+          RebuildIndex {
+              /// Data directory for SQLite index
+              #[arg(long)]
+              data_dir: Option<PathBuf>,
+          },
+          /// Generate a JWT token for API access
+          GenerateToken {
+              /// Token scope: "read" or "write"
+              #[arg(long, default_value = "write")]
+              scope: String,
+              /// Repository pattern (e.g., "*" for all)
+              #[arg(long, default_value = "*")]
+              repo: String,
+              /// Token expiry in seconds
+              #[arg(long, default_value = "86400")]
+              expiry: u64,
+          },
+      }
+      ```
+
+      Update `AppConfig::load()` to handle the new CLI structure:
+      - Extract host/port/data_dir from `Command::Serve` (or from top-level if no subcommand)
+      - For backward compat, if `cli.command.is_none()`, treat it as `Serve` with no overrides
+      - The old `Cli` had `host`, `port`, `data_dir` at the top level. Move them into `Command::Serve`.
+
+      Create a helper method:
+      ```rust
+      impl Cli {
+          /// Get serve-specific overrides (works for both explicit Serve and default None).
+          pub fn serve_overrides(&self) -> (Option<&str>, Option<u16>, Option<&PathBuf>) {
+              match &self.command {
+                  Some(Command::Serve { host, port, data_dir }) => {
+                      (host.as_deref(), *port, data_dir.as_ref())
+                  }
+                  None => (None, None, None),
+                  _ => (None, None, None),
+              }
+          }
+      }
+      ```
+
+      Update `AppConfig::load()` to use `cli.serve_overrides()` instead of direct field access.
+
+      ## Tests
+
+      Add tests to the existing `#[cfg(test)] mod tests` block (create one if none exists):
+
+      1. `test_default_config_has_sqlite_index` — verify default index_backend is "sqlite"
+      2. `test_default_presigned_url_expiry` — verify default is 3600
+      3. `test_external_s3_url_default_none` — verify default is None
+      4. `test_cli_no_subcommand_parses` — `Cli::try_parse_from(["openxet-server"])` succeeds
+      5. `test_cli_serve_subcommand_parses` — `Cli::try_parse_from(["openxet-server", "serve", "--port", "9090"])` succeeds
+      6. `test_cli_generate_token_parses` — `Cli::try_parse_from(["openxet-server", "generate-token", "--scope", "read"])` succeeds
+
+      ## Verification
+
+      ```bash
+      cargo build -p openxet-server
+      cargo test -p openxet-server config
+      ```
+
+  - id: A1
+    name: docker_compose_prod
+    level: 0
+    depends_on: []
+    input_protos: []
+    output_protos: []
+    reads:
+      - docker/compose.minio.yaml
+      - docker/Dockerfile
+    writes:
+      - docker/compose.prod.yaml
+      - docker/litestream.yml
+      - docker/Caddyfile
+      - docker/.env.example
+    test_glob: "docker/compose.prod.yaml"
+    agent_prompt: |
+      # Agent A1: Docker Compose Production Setup
+
+      You are creating Docker Compose files for production self-hosted deployment of OpenXet
+      with MinIO (S3-compatible storage), Litestream (SQLite backup), and Caddy (reverse proxy).
+
+      ## Context
+
+      OpenXet is a CAS server. The existing `docker/compose.minio.yaml` runs MinIO + the server
+      for development. You are creating a production variant with additional services.
+
+      The existing `docker/Dockerfile` builds the server binary. You should NOT modify it.
+
+      ## Task 1: docker/compose.prod.yaml
+
+      Create a production Docker Compose file with these services:
+
+      ```yaml
+      # MinIO — S3-compatible object storage
+      minio:
+        image: minio/minio:latest
+        command: server /data --console-address ":9001"
+        ports:
+          - "${MINIO_API_PORT:-9000}:9000"
+          - "${MINIO_CONSOLE_PORT:-9001}:9001"
+        environment:
+          MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+          MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+        volumes:
+          - minio-data:/data
+        healthcheck:
+          test: ["CMD", "mc", "ready", "local"]
+          interval: 5s
+          timeout: 5s
+          retries: 5
+        restart: unless-stopped
+
+      # MinIO init — create the bucket
+      minio-init:
+        image: minio/mc:latest
+        depends_on:
+          minio:
+            condition: service_healthy
+        entrypoint: >
+          /bin/sh -c "
+          mc alias set local http://minio:9000 $${MINIO_ROOT_USER:-minioadmin} $${MINIO_ROOT_PASSWORD:-minioadmin};
+          mc mb --ignore-existing local/$${S3_BUCKET:-openxet};
+          mc mb --ignore-existing local/$${BACKUP_BUCKET:-openxet-backups};
+          exit 0;
+          "
+
+      # OpenXet server
+      openxet:
+        build:
+          context: ..
+          dockerfile: docker/Dockerfile
+        ports:
+          - "${OPENXET_PORT:-8080}:8080"
+        depends_on:
+          minio-init:
+            condition: service_completed_successfully
+          litestream-restore:
+            condition: service_completed_successfully
+        volumes:
+          - openxet-data:/data
+        environment:
+          OPENXET_HOST: "0.0.0.0"
+          OPENXET_PORT: "8080"
+          OPENXET_DATA_DIR: /data
+          OPENXET_AUTH_SECRET: ${AUTH_SECRET:-change-me-in-production}
+          OPENXET_STORAGE_BACKEND: s3
+          OPENXET_S3_BUCKET: ${S3_BUCKET:-openxet}
+          OPENXET_S3_REGION: ${S3_REGION:-us-east-1}
+          OPENXET_S3_ENDPOINT: http://minio:9000
+          OPENXET_S3_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+          OPENXET_S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+          OPENXET_S3_ALLOW_HTTP: "true"
+          OPENXET_INDEX_BACKEND: sqlite
+          OPENXET_EXTERNAL_S3_URL: http://${EXTERNAL_HOST:-localhost}:${MINIO_API_PORT:-9000}
+          OPENXET_PRESIGNED_URL_EXPIRY: ${PRESIGNED_URL_EXPIRY:-3600}
+        healthcheck:
+          test: ["CMD", "curl", "-f", "http://localhost:8080/api/stats"]
+          interval: 10s
+          timeout: 5s
+          retries: 3
+          start_period: 10s
+        restart: unless-stopped
+
+      # Litestream — restore SQLite from backup on startup
+      litestream-restore:
+        image: litestream/litestream:latest
+        entrypoint: >
+          /bin/sh -c "
+          litestream restore -if-replica-exists -config /etc/litestream.yml /data/index.db || true;
+          "
+        volumes:
+          - openxet-data:/data
+          - ./litestream.yml:/etc/litestream.yml:ro
+        environment:
+          LITESTREAM_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+          LITESTREAM_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+
+      # Litestream — continuous replication sidecar
+      litestream:
+        image: litestream/litestream:latest
+        command: replicate -config /etc/litestream.yml
+        depends_on:
+          openxet:
+            condition: service_healthy
+        volumes:
+          - openxet-data:/data
+          - ./litestream.yml:/etc/litestream.yml:ro
+        environment:
+          LITESTREAM_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+          LITESTREAM_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+        restart: unless-stopped
+
+      # Caddy — reverse proxy with automatic TLS (optional)
+      caddy:
+        image: caddy:2-alpine
+        ports:
+          - "${HTTP_PORT:-80}:80"
+          - "${HTTPS_PORT:-443}:443"
+        volumes:
+          - ./Caddyfile:/etc/caddy/Caddyfile:ro
+          - caddy-data:/data
+          - caddy-config:/config
+        depends_on:
+          openxet:
+            condition: service_healthy
+        restart: unless-stopped
+        profiles:
+          - with-proxy
+
+      volumes:
+        minio-data:
+        openxet-data:
+        caddy-data:
+        caddy-config:
+      ```
+
+      Key design decisions:
+      - `litestream-restore` runs BEFORE `openxet` starts (restores SQLite from backup)
+      - `litestream` runs as a sidecar AFTER `openxet` is healthy (continuous replication)
+      - Caddy is in a `with-proxy` profile — only starts with `docker compose --profile with-proxy up`
+      - All secrets are parameterized via `.env` file
+      - Named volumes for persistence
+
+      ## Task 2: docker/litestream.yml
+
+      ```yaml
+      dbs:
+        - path: /data/index.db
+          replicas:
+            - type: s3
+              bucket: ${BACKUP_BUCKET:-openxet-backups}
+              path: sqlite/
+              endpoint: http://minio:9000
+              force-path-style: true
+      ```
+
+      ## Task 3: docker/Caddyfile
+
+      ```
+      {$DOMAIN:localhost} {
+          reverse_proxy openxet:8080
+
+          # MinIO presigned URL passthrough
+          handle /openxet/* {
+              reverse_proxy minio:9000
+          }
+      }
+      ```
+
+      ## Task 4: docker/.env.example
+
+      ```env
+      # ── MinIO ──
+      MINIO_ROOT_USER=minioadmin
+      MINIO_ROOT_PASSWORD=changeme-minio-password
+      MINIO_API_PORT=9000
+      MINIO_CONSOLE_PORT=9001
+
+      # ── OpenXet ──
+      AUTH_SECRET=changeme-auth-secret
+      OPENXET_PORT=8080
+      EXTERNAL_HOST=localhost
+      PRESIGNED_URL_EXPIRY=3600
+
+      # ── S3 ──
+      S3_BUCKET=openxet
+      S3_REGION=us-east-1
+      BACKUP_BUCKET=openxet-backups
+
+      # ── Caddy (only with --profile with-proxy) ──
+      DOMAIN=localhost
+      HTTP_PORT=80
+      HTTPS_PORT=443
+      ```
+
+      ## Verification
+
+      Run: `docker compose -f docker/compose.prod.yaml config` — should print resolved YAML without errors.
+      Run: `docker compose -f docker/compose.prod.yaml --profile with-proxy config` — should include caddy.
+
+      These are the ONLY files you create. Do NOT modify the existing Dockerfile or compose.minio.yaml.
+
+  - id: A2
+    name: lfs_transfer_agent
+    level: 0
+    depends_on: []
+    input_protos: []
+    output_protos: []
+    reads:
+      - Cargo.toml
+      - crates/chunking/src/gearhash.rs
+      - crates/hashing/src/merkle_hash.rs
+      - crates/cas_types/src/xorb.rs
+      - crates/cas_types/src/shard.rs
+      - crates/cas_types/src/reconstruction.rs
+    writes:
+      - Cargo.toml
+      - crates/lfs-agent/Cargo.toml
+      - crates/lfs-agent/src/main.rs
+      - crates/lfs-agent/src/protocol.rs
+      - crates/lfs-agent/src/client.rs
+      - crates/lfs-agent/src/upload.rs
+      - crates/lfs-agent/src/download.rs
+    test_glob: "crates/lfs-agent/src/**/*_test*"
+    agent_prompt: |
+      # Agent A2: LFS Custom Transfer Agent
+
+      You are creating a new Rust crate implementing the git-lfs custom transfer agent protocol.
+      This binary speaks JSON over stdin/stdout with git-lfs and communicates with the OpenXet
+      server via HTTP.
+
+      ## Context
+
+      Reference: https://github.com/git-lfs/git-lfs/blob/main/docs/custom-transfers.md
+
+      The LFS custom transfer protocol:
+      1. git-lfs spawns the agent binary
+      2. Agent reads JSON messages from stdin, writes JSON responses to stdout
+      3. Messages: {"event": "init", ...}, {"event": "upload", ...}, {"event": "download", ...}, {"event": "terminate"}
+      4. Responses: {"event": "complete", "oid": "...", ...} or {"event": "progress", ...}
+
+      The OpenXet server API:
+      - POST /v1/xorbs/default/{hash} — upload xorb (body = serialized xorb bytes)
+      - POST /v1/shards — upload shard (body = serialized shard bytes)
+      - GET /v1/reconstructions/{file_id} — get reconstruction info (returns JSON with terms + fetch_info)
+      - GET /v1/chunks/default-merkledb/{hash} — dedup query (returns shard binary)
+      - GET /v1/xorbs/default/{hash} — download xorb data (supports Range header)
+      - All endpoints require `Authorization: Bearer <token>` header
+
+      ## Task 1: Workspace Cargo.toml
+
+      File: `Cargo.toml` (workspace root)
+
+      Add `"crates/lfs-agent"` to the `members` array:
+      ```toml
+      [workspace]
+      members = ["crates/*"]
+      ```
+      Since this uses a glob, no change needed IF the glob already matches. Verify the glob
+      `"crates/*"` will pick up `crates/lfs-agent`. It should — glob matches one level.
+
+      ## Task 2: crates/lfs-agent/Cargo.toml
+
+      ```toml
+      [package]
+      name = "openxet-lfs-agent"
+      version = "0.1.0"
+      edition.workspace = true
+      license.workspace = true
+
+      [[bin]]
+      name = "openxet-lfs-agent"
+      path = "src/main.rs"
+
+      [dependencies]
+      openxet-hashing = { workspace = true }
+      openxet-chunking = { workspace = true }
+      openxet-cas-types = { workspace = true }
+      tokio = { version = "1", features = ["full"] }
+      serde = { workspace = true }
+      serde_json = { workspace = true }
+      anyhow = { workspace = true }
+      bytes = { workspace = true }
+      reqwest = { version = "0.12", features = ["json"] }
+      tracing = "0.1"
+      tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+      [dev-dependencies]
+      tempfile = "3"
+      ```
+
+      ## Task 3: crates/lfs-agent/src/protocol.rs
+
+      Implement the git-lfs custom transfer agent JSON protocol:
+
+      ```rust
+      use serde::{Deserialize, Serialize};
+
+      #[derive(Debug, Deserialize)]
+      #[serde(tag = "event")]
+      #[serde(rename_all = "lowercase")]
+      pub enum LfsRequest {
+          Init {
+              operation: String,  // "upload" or "download"
+              remote: Option<String>,
+              concurrent: Option<bool>,
+              concurrenttransfers: Option<u32>,
+          },
+          Upload {
+              oid: String,
+              size: u64,
+              path: String,
+              action: Option<LfsAction>,
+          },
+          Download {
+              oid: String,
+              size: u64,
+              action: Option<LfsAction>,
+          },
+          Terminate,
+      }
+
+      #[derive(Debug, Deserialize)]
+      pub struct LfsAction {
+          pub href: Option<String>,
+          pub header: Option<std::collections::HashMap<String, String>>,
+          pub expires_at: Option<String>,
+      }
+
+      #[derive(Debug, Serialize)]
+      #[serde(untagged)]
+      pub enum LfsResponse {
+          InitComplete {},
+          Progress {
+              event: String,  // "progress"
+              oid: String,
+              #[serde(rename = "bytesSoFar")]
+              bytes_so_far: u64,
+              #[serde(rename = "bytesSinceLast")]
+              bytes_since_last: u64,
+          },
+          Complete {
+              event: String,  // "complete"
+              oid: String,
+              #[serde(skip_serializing_if = "Option::is_none")]
+              path: Option<String>,
+              #[serde(skip_serializing_if = "Option::is_none")]
+              error: Option<LfsError>,
+          },
+      }
+
+      #[derive(Debug, Serialize)]
+      pub struct LfsError {
+          pub code: i32,
+          pub message: String,
+      }
+      ```
+
+      Read requests from stdin line-by-line (each line is a JSON object).
+      Write responses to stdout (one JSON object per line, followed by newline).
+
+      ## Task 4: crates/lfs-agent/src/client.rs
+
+      HTTP client for the OpenXet server:
+
+      ```rust
+      pub struct OpenXetClient {
+          http: reqwest::Client,
+          base_url: String,
+          token: String,
+      }
+
+      impl OpenXetClient {
+          pub fn new(base_url: &str, token: &str) -> Self { ... }
+
+          /// Upload a serialized xorb. Returns true if newly inserted.
+          pub async fn upload_xorb(&self, hash: &str, data: bytes::Bytes) -> anyhow::Result<bool> { ... }
+
+          /// Upload a serialized shard.
+          pub async fn upload_shard(&self, data: bytes::Bytes) -> anyhow::Result<()> { ... }
+
+          /// Get reconstruction info for a file.
+          pub async fn get_reconstruction(&self, file_id: &str)
+              -> anyhow::Result<openxet_cas_types::reconstruction::QueryReconstructionResponse> { ... }
+
+          /// Download xorb data (with optional byte range).
+          pub async fn download_xorb_range(&self, url: &str, start: u64, end: u64)
+              -> anyhow::Result<bytes::Bytes> { ... }
+
+          /// Download full URL (for presigned URLs that don't need auth).
+          pub async fn download_url(&self, url: &str) -> anyhow::Result<bytes::Bytes> { ... }
+      }
+      ```
+
+      Configuration from env vars:
+      - `OPENXET_SERVER` — base URL (e.g., "http://localhost:8080")
+      - `OPENXET_TOKEN` — JWT token
+
+      ## Task 5: crates/lfs-agent/src/upload.rs
+
+      Upload flow:
+      1. Read the file from `path` (given by LFS)
+      2. CDC chunk it using `openxet_chunking::chunk_data()`
+      3. Compute chunk hashes using `openxet_hashing::compute_chunk_hash()`
+      4. Split chunks into xorb groups (respecting XORB_SOFT_LIMIT = 60 MiB)
+      5. For each xorb group:
+         a. Serialize using `openxet_cas_types::xorb::serialize_single_chunk()` for each chunk
+         b. Compute xorb hash using `openxet_cas_types::xorb::compute_xorb_hash()`
+         c. Upload via `client.upload_xorb()`
+      6. Build shard (file_info_blocks + cas_info_blocks) using types from `openxet_cas_types::shard`
+      7. Upload shard via `client.upload_shard()`
+      8. Report file_hash as the OID to LFS
+
+      Use `openxet_cas_types::chunk::CompressionType::Lz4` for compression.
+      Compute file hash using `openxet_hashing::compute_file_hash()`.
+
+      IMPORTANT: Follow the same xorb splitting and shard construction logic as
+      `crates/server/src/routes/management.rs::process_file_upload()`. Study that function
+      carefully — it is the reference implementation.
+
+      ## Task 6: crates/lfs-agent/src/download.rs
+
+      Download flow:
+      1. Query reconstruction: `client.get_reconstruction(oid)`
+      2. For each term in `response.terms`:
+         a. Get the fetch_info for this term's xorb hash
+         b. Download the xorb data from the URL in fetch_info (may be presigned S3 URL)
+         c. Use Range header with url_range.start and url_range.end
+      3. Decompress each chunk using `openxet_cas_types::xorb::deserialize_xorb_range()`
+      4. Concatenate decompressed chunks to reconstruct the file
+      5. Apply `offset_into_first_range` if non-zero (trim leading bytes)
+      6. Write to the path specified by LFS
+
+      ## Task 7: crates/lfs-agent/src/main.rs
+
+      Main loop:
+      ```rust
+      #[tokio::main]
+      async fn main() -> anyhow::Result<()> {
+          // Read config from env
+          let server_url = std::env::var("OPENXET_SERVER")
+              .unwrap_or_else(|_| "http://localhost:8080".to_string());
+          let token = std::env::var("OPENXET_TOKEN")
+              .map_err(|_| anyhow::anyhow!("OPENXET_TOKEN env var required"))?;
+
+          let client = client::OpenXetClient::new(&server_url, &token);
+
+          let stdin = std::io::stdin();
+          let stdout = std::io::stdout();
+
+          // Read init message
+          // Process upload/download messages in a loop
+          // On terminate, exit cleanly
+      }
+      ```
+
+      ## Tests
+
+      In protocol.rs: test JSON deserialization of init, upload, download, terminate messages.
+      In client.rs: test URL construction, header setting.
+      In upload.rs: test CDC + xorb splitting logic with small test data (reuse patterns from cas_types tests).
+      In download.rs: test reconstruction assembly with pre-built fetch_info.
+
+      ## Verification
+
+      ```bash
+      cargo build -p openxet-lfs-agent
+      cargo test -p openxet-lfs-agent
+      ```
+
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # LEVEL 1 — Index + Presign Infrastructure (depends on A0)
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  - id: A3
+    name: sqlite_index_impl
+    level: 1
+    depends_on: [A0]
+    input_protos: [CargoDepsAdditions]
+    output_protos: [ChunkIndexTrait, FileIndexTrait, XorbMetadataIndexTrait, FileIndexDispatch, ChunkIndexDispatch, XorbMetadataIndexDispatch, SqliteFileIndex, SqliteChunkIndex, SqliteXorbMetadataIndex]
+    reads:
+      - crates/server/src/storage/index/mod.rs
+      - crates/server/src/storage/index/file_index.rs
+      - crates/server/src/storage/index/chunk_index.rs
+      - crates/server/src/storage/mod.rs
+      - crates/server/src/storage/error.rs
+      - crates/server/Cargo.toml
+    writes:
+      - crates/server/src/storage/index/mod.rs
+      - crates/server/src/storage/index/file_index.rs
+      - crates/server/src/storage/index/chunk_index.rs
+      - crates/server/src/storage/index/sqlite.rs
+      - crates/server/src/storage/index/xorb_metadata.rs
+      - crates/server/src/storage/index/dispatch.rs
+      - crates/server/src/storage/mod.rs
+    test_glob: "crates/server/src/storage/index/*_test*"
+    agent_prompt: |
+      # Agent A3: SQLite Index Implementation
+
+      You are implementing SQLite-backed indexes for OpenXet's CAS server.
+      This is the critical path work item — all other indexing work depends on you.
+
+      ## Context
+
+      The server has two index traits in `crates/server/src/storage/index/mod.rs`:
+      - `FileIndex`: maps file_hash → shard_hash (for reconstruction)
+      - `ChunkIndex`: maps chunk_hash → Vec<ChunkLocation> (for dedup)
+
+      Currently only filesystem implementations exist (one file per hash entry).
+      You are adding SQLite implementations and dispatch enums.
+
+      `rusqlite` has already been added to Cargo.toml by agent A0.
+      The Rust edition is 2024 (async traits work natively, no Pin<Box> needed).
+
+      ## Task 1: Extend ChunkIndex trait
+
+      File: `crates/server/src/storage/index/mod.rs`
+
+      Add two new methods to the `ChunkIndex` trait:
+
+      ```rust
+      pub trait ChunkIndex: Send + Sync {
+          // ... existing get() and put() ...
+
+          /// Bulk insert multiple chunk→location mappings.
+          /// Implementations should use a transaction for atomicity.
+          fn put_batch(
+              &self,
+              entries: &[(String, ChunkLocation)],
+          ) -> impl Future<Output = Result<(), StorageError>> + Send;
+
+          /// Reverse lookup: all chunks in a given xorb, sorted by chunk_index.
+          /// Returns Vec<(chunk_hash_hex, chunk_index)>.
+          fn get_by_xorb(
+              &self,
+              xorb_hash: &str,
+          ) -> impl Future<Output = Result<Vec<(String, u32)>, StorageError>> + Send;
+      }
+      ```
+
+      Add `put_batch` to `FileIndex`:
+
+      ```rust
+      pub trait FileIndex: Send + Sync {
+          // ... existing get(), put(), list_all() ...
+
+          /// Bulk insert multiple file→shard mappings.
+          fn put_batch(
+              &self,
+              entries: &[(String, String)],
+          ) -> impl Future<Output = Result<(), StorageError>> + Send;
+      }
+      ```
+
+      ## Task 2: Update FilesystemChunkIndex
+
+      File: `crates/server/src/storage/index/chunk_index.rs`
+
+      Add implementations for the new trait methods:
+
+      ```rust
+      async fn put_batch(&self, entries: &[(String, ChunkLocation)]) -> Result<(), StorageError> {
+          for (hash, loc) in entries {
+              self.put(hash, loc.clone()).await?;
+          }
+          Ok(())
+      }
+
+      async fn get_by_xorb(&self, xorb_hash: &str) -> Result<Vec<(String, u32)>, StorageError> {
+          validate_hash(xorb_hash)?;
+          let mut results = Vec::new();
+          let mut read_dir = tokio::fs::read_dir(&self.dir).await
+              .map_err(|e| StorageError::io(e, &self.dir))?;
+          while let Some(entry) = read_dir.next_entry().await
+              .map_err(|e| StorageError::io(e, &self.dir))? {
+              let name = entry.file_name().to_string_lossy().to_string();
+              if name.starts_with('.') { continue; }
+              if let Ok(data) = tokio::fs::read(entry.path()).await {
+                  if let Ok(locations) = serde_json::from_slice::<Vec<ChunkLocation>>(&data) {
+                      for loc in locations {
+                          if loc.xorb_hash == xorb_hash {
+                              results.push((name.clone(), loc.chunk_index));
+                          }
+                      }
+                  }
+              }
+          }
+          results.sort_by_key(|(_, idx)| *idx);
+          Ok(results)
+      }
+      ```
+
+      ## Task 3: Update FilesystemFileIndex
+
+      File: `crates/server/src/storage/index/file_index.rs`
+
+      ```rust
+      async fn put_batch(&self, entries: &[(String, String)]) -> Result<(), StorageError> {
+          for (file_hash, shard_hash) in entries {
+              self.put(file_hash, shard_hash).await?;
+          }
+          Ok(())
+      }
+      ```
+
+      ## Task 4: Create XorbMetadataIndex trait and types
+
+      File: `crates/server/src/storage/index/xorb_metadata.rs` (NEW)
+
+      ```rust
+      use super::super::error::StorageError;
+
+      /// Metadata for a single chunk within a xorb.
+      #[derive(Debug, Clone, PartialEq, Eq)]
+      pub struct XorbChunkMetadata {
+          pub chunk_index: u32,
+          pub chunk_hash: String,
+          pub compressed_offset_start: u64,
+          pub compressed_offset_end: u64,
+          pub uncompressed_offset: u64,
+          pub uncompressed_size: u64,
+      }
+
+      /// Index storing pre-computed byte offsets for chunks within xorbs.
+      /// Eliminates the need to re-read and re-parse xorb binaries for
+      /// reconstruction (byte offsets) and dedup (chunk hashes).
+      pub trait XorbMetadataIndex: Send + Sync {
+          /// Get all chunk metadata for a xorb, ordered by chunk_index.
+          fn get(
+              &self,
+              xorb_hash: &str,
+          ) -> impl Future<Output = Result<Vec<XorbChunkMetadata>, StorageError>> + Send;
+
+          /// Store metadata for all chunks in a xorb (transactional).
+          fn put(
+              &self,
+              xorb_hash: &str,
+              metadata: &[XorbChunkMetadata],
+          ) -> impl Future<Output = Result<(), StorageError>> + Send;
+
+          /// Check if metadata exists for a xorb.
+          fn exists(
+              &self,
+              xorb_hash: &str,
+          ) -> impl Future<Output = Result<bool, StorageError>> + Send;
+      }
+
+      /// No-op implementation for filesystem index backend.
+      /// Always returns empty results, causing callers to fall back to xorb parsing.
+      pub struct NoopXorbMetadataIndex;
+
+      impl XorbMetadataIndex for NoopXorbMetadataIndex {
+          async fn get(&self, _xorb_hash: &str) -> Result<Vec<XorbChunkMetadata>, StorageError> {
+              Ok(Vec::new())
+          }
+          async fn put(&self, _xorb_hash: &str, _metadata: &[XorbChunkMetadata]) -> Result<(), StorageError> {
+              Ok(())
+          }
+          async fn exists(&self, _xorb_hash: &str) -> Result<bool, StorageError> {
+              Ok(false)
+          }
+      }
+      ```
+
+      ## Task 5: Create SQLite implementations
+
+      File: `crates/server/src/storage/index/sqlite.rs` (NEW)
+
+      All three SQLite index types share the same DB file but use SEPARATE connections.
+      Each constructor:
+      1. Opens/creates the SQLite database at the given path
+      2. Sets `PRAGMA journal_mode=WAL` (concurrent reads + single writer)
+      3. Creates its table(s) with `CREATE TABLE IF NOT EXISTS`
+      4. Wraps the Connection in `tokio::sync::Mutex`
+
+      Use `tokio::task::spawn_blocking` for all rusqlite operations (rusqlite is synchronous).
+
+      ### SqliteFileIndex
+
+      ```rust
+      pub struct SqliteFileIndex {
+          conn: tokio::sync::Mutex<rusqlite::Connection>,
+      }
+
+      impl SqliteFileIndex {
+          pub fn new(db_path: &std::path::Path) -> Result<Self, StorageError> {
+              let conn = rusqlite::Connection::open(db_path)
+                  .map_err(|e| StorageError::ObjectStore(format!("sqlite open error: {e}")))?;
+              conn.execute_batch("PRAGMA journal_mode=WAL;")
+                  .map_err(|e| StorageError::ObjectStore(format!("sqlite pragma error: {e}")))?;
+              conn.execute_batch(
+                  "CREATE TABLE IF NOT EXISTS files (
+                      file_hash TEXT PRIMARY KEY,
+                      shard_hash TEXT NOT NULL
+                  );"
+              ).map_err(|e| StorageError::ObjectStore(format!("sqlite create table error: {e}")))?;
+              Ok(Self { conn: tokio::sync::Mutex::new(conn) })
+          }
+      }
+      ```
+
+      For `get()`: `SELECT shard_hash FROM files WHERE file_hash = ?`
+      For `put()`: `INSERT OR REPLACE INTO files (file_hash, shard_hash) VALUES (?, ?)`
+      For `list_all()`: `SELECT file_hash, shard_hash FROM files ORDER BY file_hash`
+      For `put_batch()`: wrap in `BEGIN; ... COMMIT;` with prepared statement in a loop.
+
+      ### SqliteChunkIndex
+
+      Table: `chunks(chunk_hash TEXT, xorb_hash TEXT, chunk_index INTEGER, PRIMARY KEY(chunk_hash, xorb_hash, chunk_index))`
+      Secondary index: `CREATE INDEX IF NOT EXISTS idx_chunks_xorb ON chunks(xorb_hash)`
+
+      For `get()`: `SELECT xorb_hash, chunk_index FROM chunks WHERE chunk_hash = ?`
+      For `put()`: `INSERT OR IGNORE INTO chunks (chunk_hash, xorb_hash, chunk_index) VALUES (?, ?, ?)`
+      For `put_batch()`: transaction with prepared statement.
+      For `get_by_xorb()`: `SELECT chunk_hash, chunk_index FROM chunks WHERE xorb_hash = ? ORDER BY chunk_index`
+
+      ### SqliteXorbMetadataIndex
+
+      Table:
+      ```sql
+      CREATE TABLE IF NOT EXISTS xorb_metadata (
+          xorb_hash TEXT,
+          chunk_index INTEGER,
+          chunk_hash TEXT NOT NULL,
+          compressed_offset_start INTEGER NOT NULL,
+          compressed_offset_end INTEGER NOT NULL,
+          uncompressed_offset INTEGER NOT NULL,
+          uncompressed_size INTEGER NOT NULL,
+          PRIMARY KEY(xorb_hash, chunk_index)
+      );
+      ```
+
+      For `get()`: `SELECT * FROM xorb_metadata WHERE xorb_hash = ? ORDER BY chunk_index`
+      For `put()`: transaction, `INSERT OR REPLACE INTO xorb_metadata ...`
+      For `exists()`: `SELECT 1 FROM xorb_metadata WHERE xorb_hash = ? LIMIT 1`
+
+      IMPORTANT: All rusqlite calls must be wrapped in `spawn_blocking` because
+      rusqlite::Connection is not Send. Use a pattern like:
+
+      ```rust
+      let conn = self.conn.lock().await;
+      let result = {
+          // Clone what you need before moving into the closure
+          let hash = chunk_hash.to_string();
+          tokio::task::spawn_blocking(move || {
+              // ... use conn ...
+          }).await.map_err(|e| StorageError::ObjectStore(format!("task join error: {e}")))?
+      };
+      ```
+
+      Wait — actually, `Mutex<Connection>` with the lock held across `spawn_blocking`
+      won't work because MutexGuard is not Send. Instead, use this pattern:
+
+      ```rust
+      // DON'T hold the MutexGuard across spawn_blocking.
+      // Instead, take the connection out briefly:
+      // Actually, the simplest pattern for rusqlite + tokio is:
+      //   Use std::sync::Mutex (not tokio::sync::Mutex) so you can lock inside spawn_blocking.
+      ```
+
+      Actually, the correct pattern for rusqlite + tokio:
+
+      ```rust
+      use std::sync::Mutex;  // NOT tokio::sync::Mutex
+
+      pub struct SqliteFileIndex {
+          conn: Mutex<rusqlite::Connection>,
+      }
+
+      // rusqlite::Connection is Send but not Sync.
+      // Wrapping in std::sync::Mutex<Connection> makes it Sync.
+      // Access pattern:
+      impl FileIndex for SqliteFileIndex {
+          async fn get(&self, file_hash: &str) -> Result<Option<String>, StorageError> {
+              validate_hash(file_hash)?;
+              let hash = file_hash.to_string();
+              let conn = self.conn.lock()
+                  .map_err(|e| StorageError::ObjectStore(format!("mutex poisoned: {e}")))?;
+              let result = conn.query_row(
+                  "SELECT shard_hash FROM files WHERE file_hash = ?",
+                  [&hash],
+                  |row| row.get::<_, String>(0),
+              );
+              match result {
+                  Ok(shard_hash) => Ok(Some(shard_hash)),
+                  Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                  Err(e) => Err(StorageError::ObjectStore(format!("sqlite query error: {e}"))),
+              }
+          }
+      }
+      ```
+
+      For bulk operations with transactions:
+      ```rust
+      async fn put_batch(&self, entries: &[(String, String)]) -> Result<(), StorageError> {
+          if entries.is_empty() { return Ok(()); }
+          let entries = entries.to_vec();
+          let conn = self.conn.lock()
+              .map_err(|e| StorageError::ObjectStore(format!("mutex poisoned: {e}")))?;
+          let tx = conn.unchecked_transaction()
+              .map_err(|e| StorageError::ObjectStore(format!("sqlite tx error: {e}")))?;
+          {
+              let mut stmt = tx.prepare("INSERT OR REPLACE INTO files (file_hash, shard_hash) VALUES (?, ?)")
+                  .map_err(|e| StorageError::ObjectStore(format!("sqlite prepare error: {e}")))?;
+              for (fh, sh) in &entries {
+                  stmt.execute(rusqlite::params![fh, sh])
+                      .map_err(|e| StorageError::ObjectStore(format!("sqlite insert error: {e}")))?;
+              }
+          }
+          tx.commit()
+              .map_err(|e| StorageError::ObjectStore(format!("sqlite commit error: {e}")))?;
+          Ok(())
+      }
+      ```
+
+      Note: use `conn.unchecked_transaction()` rather than `conn.transaction()` because
+      `transaction()` requires `&mut self` but `Mutex::lock()` gives `MutexGuard<Connection>`
+      which derefs to `&Connection`, not `&mut Connection`.
+
+      ## Task 6: Create dispatch enums
+
+      File: `crates/server/src/storage/index/dispatch.rs` (NEW)
+
+      ```rust
+      use super::*;
+      use super::sqlite::{SqliteFileIndex, SqliteChunkIndex, SqliteXorbMetadataIndex};
+      use super::xorb_metadata::{XorbMetadataIndex, XorbChunkMetadata, NoopXorbMetadataIndex};
+
+      pub enum FileIndexDispatch {
+          Filesystem(FilesystemFileIndex),
+          Sqlite(SqliteFileIndex),
+      }
+
+      impl FileIndex for FileIndexDispatch {
+          async fn get(&self, file_hash: &str) -> Result<Option<String>, StorageError> {
+              match self {
+                  Self::Filesystem(i) => i.get(file_hash).await,
+                  Self::Sqlite(i) => i.get(file_hash).await,
+              }
+          }
+          // ... delegate all methods ...
+      }
+
+      pub enum ChunkIndexDispatch {
+          Filesystem(FilesystemChunkIndex),
+          Sqlite(SqliteChunkIndex),
+      }
+      // ... delegate all methods ...
+
+      pub enum XorbMetadataIndexDispatch {
+          Noop(NoopXorbMetadataIndex),
+          Sqlite(SqliteXorbMetadataIndex),
+      }
+      // ... delegate all methods ...
+      ```
+
+      ## Task 7: Update mod.rs and storage/mod.rs
+
+      File: `crates/server/src/storage/index/mod.rs`
+      - Add `pub mod sqlite;`, `pub mod xorb_metadata;`, `pub mod dispatch;`
+      - Add re-exports for new types
+
+      File: `crates/server/src/storage/mod.rs`
+      - Add re-exports: `FileIndexDispatch`, `ChunkIndexDispatch`, `XorbMetadataIndexDispatch`,
+        `XorbMetadataIndex`, `XorbChunkMetadata`, `NoopXorbMetadataIndex`,
+        `SqliteFileIndex`, `SqliteChunkIndex`, `SqliteXorbMetadataIndex`
+
+      ## Tests
+
+      Write comprehensive tests in each new file's `#[cfg(test)] mod tests` block:
+
+      ### sqlite.rs tests:
+      1. `test_file_index_put_get` — roundtrip
+      2. `test_file_index_get_missing` — returns None
+      3. `test_file_index_overwrite` — put same key twice, second wins
+      4. `test_file_index_list_all` — multiple entries returned sorted
+      5. `test_file_index_put_batch` — batch insert, verify all present
+      6. `test_file_index_put_batch_empty` — empty batch is no-op
+      7. `test_chunk_index_put_get` — roundtrip
+      8. `test_chunk_index_get_missing` — returns empty vec
+      9. `test_chunk_index_multiple_locations` — same chunk in multiple xorbs
+      10. `test_chunk_index_dedup` — same location twice = single entry
+      11. `test_chunk_index_put_batch` — batch insert with transaction
+      12. `test_chunk_index_get_by_xorb` — reverse lookup returns all chunks sorted
+      13. `test_chunk_index_get_by_xorb_empty` — nonexistent xorb returns empty
+      14. `test_chunk_index_invalid_hash` — bad hash format rejected
+      15. `test_xorb_metadata_put_get` — roundtrip
+      16. `test_xorb_metadata_exists` — exists returns true/false correctly
+      17. `test_xorb_metadata_ordering` — metadata returned in chunk_index order
+
+      Use `tempfile::NamedTempFile` for SQLite DB paths in tests.
+
+      ### dispatch.rs tests:
+      18. `test_dispatch_delegates_to_sqlite` — verify dispatch enum delegates correctly
+      19. `test_dispatch_delegates_to_filesystem` — verify dispatch enum delegates correctly
+
+      ## Verification
+
+      ```bash
+      cargo test -p openxet-server -- storage::index
+      ```
+
+  - id: A4
+    name: presigned_url_infra
+    level: 1
+    depends_on: [A0]
+    input_protos: [StorageConfigAdditions]
+    output_protos: [ObjectStoreBackendChanges, StorageDispatchChanges, BuilderChanges]
+    reads:
+      - crates/server/src/storage/object_store_backend.rs
+      - crates/server/src/storage/builder.rs
+      - crates/server/src/storage/dispatch.rs
+      - crates/server/src/storage/error.rs
+      - crates/server/src/config.rs
+    writes:
+      - crates/server/src/storage/object_store_backend.rs
+      - crates/server/src/storage/builder.rs
+      - crates/server/src/storage/dispatch.rs
+    test_glob: "crates/server/src/storage/object_store_backend.rs"
+    agent_prompt: |
+      # Agent A4: Presigned URL Infrastructure
+
+      You are adding presigned S3 URL support to the storage layer.
+      When configured, clients download xorbs directly from MinIO instead of proxying through the server.
+
+      ## Context
+
+      The `object_store` crate (v0.11) supports presigned URLs through the `Signer` trait.
+      `AmazonS3` implements both `ObjectStore` and `Signer`.
+      Config fields `external_s3_url` and `presigned_url_expiry_seconds` have been added by A0.
+
+      ## Task 1: Modify ObjectStoreBackend
+
+      File: `crates/server/src/storage/object_store_backend.rs`
+
+      Add a signer field and presign method:
+
+      ```rust
+      use std::time::Duration;
+      use url::Url;
+
+      pub struct ObjectStoreBackend {
+          store: Arc<dyn ObjectStore>,
+          signer: Option<Arc<dyn object_store::signer::Signer>>,
+      }
+
+      impl ObjectStoreBackend {
+          pub fn new(
+              store: Arc<dyn ObjectStore>,
+              signer: Option<Arc<dyn object_store::signer::Signer>>,
+          ) -> Self {
+              Self { store, signer }
+          }
+
+          /// Generate a presigned GET URL for a xorb.
+          /// Returns None if presigning is not available (no signer configured).
+          pub async fn presign_xorb_url(
+              &self,
+              hash: &str,
+              expiry: Duration,
+          ) -> Result<Option<Url>, StorageError> {
+              let Some(signer) = &self.signer else {
+                  return Ok(None);
+              };
+              let path = Self::xorb_path(hash);
+              let url = signer
+                  .signed_url(
+                      http::Method::GET,
+                      &path,
+                      expiry,
+                  )
+                  .await
+                  .map_err(|e| StorageError::ObjectStore(format!("presign error: {e}")))?;
+              Ok(Some(url))
+          }
+      }
+      ```
+
+      IMPORTANT: Check the exact `object_store` 0.11 API for the `Signer` trait. It might be:
+      - `object_store::signer::Signer` with method `signed_url(method, path, expires_in)`
+      - The `method` parameter type might be `http::Method` or a custom enum
+      - Import the right types by checking `object_store::signer`
+
+      If the `Signer` trait doesn't exist in object_store 0.11, use the `ObjectStore::signed_url`
+      method directly if available, or build the presigned URL manually using AWS SigV4.
+      The agent should check `cargo doc -p object_store --open` or read the source.
+
+      Update the existing `new()` call sites — there is currently only one:
+      the constructor call `ObjectStoreBackend::new(Arc::new(store))` in builder.rs.
+      That needs to become `ObjectStoreBackend::new(Arc::new(store), signer)`.
+
+      ## Task 2: Modify StorageDispatch
+
+      File: `crates/server/src/storage/dispatch.rs`
+
+      Add a presign method:
+
+      ```rust
+      impl StorageDispatch {
+          /// Generate a presigned GET URL for a xorb.
+          /// Returns None if the backend doesn't support presigning.
+          pub async fn presign_xorb_url(
+              &self,
+              hash: &str,
+              expiry: std::time::Duration,
+          ) -> Result<Option<url::Url>, StorageError> {
+              match self {
+                  Self::Filesystem(_) => Ok(None),
+                  Self::ObjectStore(b) => b.presign_xorb_url(hash, expiry).await,
+              }
+          }
+      }
+      ```
+
+      ## Task 3: Modify builder.rs
+
+      File: `crates/server/src/storage/builder.rs`
+
+      In the `"s3"` arm:
+
+      ```rust
+      "s3" => {
+          // ... existing builder setup ...
+          let store = builder.build().context("failed to build S3 client")?;
+
+          // Build signer if external S3 URL is configured
+          let signer: Option<Arc<dyn object_store::signer::Signer>> =
+              if config.external_s3_url.is_some() {
+                  // AmazonS3 implements Signer — clone the store for signing
+                  Some(Arc::new(store.clone()) as Arc<dyn object_store::signer::Signer>)
+              } else {
+                  None
+              };
+
+          Ok(StorageDispatch::ObjectStore(ObjectStoreBackend::new(
+              Arc::new(store),
+              signer,
+          )))
+      }
+      ```
+
+      IMPORTANT: `AmazonS3` must implement `Clone` for this to work. If it doesn't,
+      build TWO AmazonS3 instances from the same builder (call build() twice), one for
+      ObjectStore and one for Signer.
+
+      For non-S3 backends (gcs, azure, filesystem):
+      ```rust
+      ObjectStoreBackend::new(Arc::new(store), None)
+      ```
+
+      ## Tests
+
+      In object_store_backend.rs tests:
+      1. `test_presign_returns_none_without_signer` — ObjectStoreBackend with signer=None returns Ok(None)
+      2. `test_new_with_signer` — constructor accepts signer parameter
+
+      In dispatch.rs tests (or inline):
+      3. `test_filesystem_dispatch_presign_returns_none` — filesystem backend returns None
+
+      Note: testing actual presigned URLs requires a real S3/MinIO instance.
+      For unit tests, just verify the None/Some path logic.
+
+      ## Verification
+
+      ```bash
+      cargo test -p openxet-server -- storage::object_store
+      cargo test -p openxet-server -- storage::dispatch
+      ```
+
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # LEVEL 2 — Wiring (depends on A3, A4)
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  - id: A5
+    name: state_main_cli
+    level: 2
+    depends_on: [A3, A4]
+    input_protos: [FileIndexDispatch, ChunkIndexDispatch, XorbMetadataIndexDispatch, StorageDispatchChanges, CliStructure]
+    output_protos: [AppStateChanges, MainChanges]
+    reads:
+      - crates/server/src/state.rs
+      - crates/server/src/main.rs
+      - crates/server/src/lib.rs
+      - crates/server/src/config.rs
+      - crates/server/src/storage/index/dispatch.rs
+      - crates/server/src/storage/index/sqlite.rs
+      - crates/server/src/storage/mod.rs
+      - crates/server/src/auth/jwt.rs
+    writes:
+      - crates/server/src/state.rs
+      - crates/server/src/main.rs
+      - crates/server/src/lib.rs
+      - crates/server/src/rebuild.rs
+    test_glob: "crates/server/src/main.rs"
+    agent_prompt: |
+      # Agent A5: State + Main + CLI Wiring
+
+      You are wiring the new index dispatch types and presigned URL support into AppState
+      and main.rs. You also add the CLI subcommand routing.
+
+      ## Context
+
+      Agent A3 created: FileIndexDispatch, ChunkIndexDispatch, XorbMetadataIndexDispatch,
+      SqliteFileIndex, SqliteChunkIndex, SqliteXorbMetadataIndex, NoopXorbMetadataIndex.
+      Agent A4 modified: StorageDispatch now has presign_xorb_url().
+      Agent A0 added: config fields (index_backend, presigned_url_expiry_seconds, external_s3_url)
+      and CLI subcommand structure (Command enum with Serve, RebuildIndex, GenerateToken).
+
+      ## Task 1: Update AppState
+
+      File: `crates/server/src/state.rs`
+
+      Change the index types from concrete to dispatch:
+
+      ```rust
+      use crate::storage::{
+          FileIndexDispatch, ChunkIndexDispatch, XorbMetadataIndexDispatch,
+          StorageDispatch,
+      };
+
+      #[derive(Clone)]
+      pub struct AppState {
+          pub storage: Arc<StorageDispatch>,
+          pub file_index: Arc<FileIndexDispatch>,
+          pub chunk_index: Arc<ChunkIndexDispatch>,
+          pub xorb_metadata_index: Arc<XorbMetadataIndexDispatch>,
+          pub config: Arc<AppConfig>,
+          pub upload_sessions: Arc<Mutex<HashMap<String, UploadSession>>>,
+      }
+      ```
+
+      ## Task 2: Update main.rs
+
+      File: `crates/server/src/main.rs`
+
+      Major changes:
+      1. Import the new dispatch types and SQLite/filesystem constructors
+      2. Match on the CLI subcommand
+      3. Initialize indexes based on config.storage.index_backend
+      4. Implement generate-token subcommand inline
+
+      ```rust
+      use openxet_server::config::{AppConfig, Cli, Command};
+      use openxet_server::storage::{
+          build_storage,
+          FileIndexDispatch, ChunkIndexDispatch, XorbMetadataIndexDispatch,
+          FilesystemFileIndex, FilesystemChunkIndex,
+          SqliteFileIndex, SqliteChunkIndex, SqliteXorbMetadataIndex,
+          NoopXorbMetadataIndex,
+      };
+
+      #[tokio::main]
+      async fn main() -> Result<()> {
+          tracing_subscriber::fmt()
+              .json()
+              .with_env_filter(
+                  EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+              )
+              .with_target(true)
+              .with_current_span(true)
+              .init();
+
+          let cli = Cli::parse();
+          let config = AppConfig::load(&cli)?;
+
+          match cli.command {
+              None | Some(Command::Serve { .. }) => run_server(config).await,
+              Some(Command::RebuildIndex { data_dir }) => {
+                  let mut config = config;
+                  if let Some(dir) = data_dir {
+                      config.storage.data_dir = dir;
+                  }
+                  openxet_server::rebuild::run_rebuild(&config).await
+              }
+              Some(Command::GenerateToken { scope, repo, expiry }) => {
+                  generate_token(&config, &scope, &repo, expiry)
+              }
+          }
+      }
+
+      fn generate_token(config: &AppConfig, scope: &str, repo: &str, expiry: u64) -> Result<()> {
+          use openxet_server::auth::{Claims, Scope, create_token};
+          use std::time::{SystemTime, UNIX_EPOCH};
+
+          let scope = match scope {
+              "read" => Scope::Read,
+              "write" => Scope::Write,
+              _ => anyhow::bail!("scope must be 'read' or 'write'"),
+          };
+          let exp = SystemTime::now()
+              .duration_since(UNIX_EPOCH)?
+              .as_secs() + expiry;
+          let claims = Claims {
+              scope,
+              repo: repo.to_string(),
+              exp: exp as usize,
+          };
+          let token = create_token(&config.auth.secret, &claims)?;
+          println!("{token}");
+          Ok(())
+      }
+
+      async fn run_server(config: AppConfig) -> Result<()> {
+          let data_dir = config.data_dir();
+          let storage = Arc::new(build_storage(&config.storage).await?);
+
+          // Initialize indexes based on config
+          let (file_index, chunk_index, xorb_metadata_index) = match config.storage.index_backend.as_str() {
+              "sqlite" => {
+                  let db_path = data_dir.join("index.db");
+                  let fi = FileIndexDispatch::Sqlite(SqliteFileIndex::new(&db_path)?);
+                  let ci = ChunkIndexDispatch::Sqlite(SqliteChunkIndex::new(&db_path)?);
+                  let xm = XorbMetadataIndexDispatch::Sqlite(SqliteXorbMetadataIndex::new(&db_path)?);
+                  (fi, ci, xm)
+              }
+              _ => {
+                  let fi = FileIndexDispatch::Filesystem(FilesystemFileIndex::new(data_dir).await?);
+                  let ci = ChunkIndexDispatch::Filesystem(FilesystemChunkIndex::new(data_dir).await?);
+                  let xm = XorbMetadataIndexDispatch::Noop(NoopXorbMetadataIndex);
+                  (fi, ci, xm)
+              }
+          };
+
+          // ... rest of server setup (upload sessions, router, listener) ...
+          // Copy the existing server setup from main.rs, replacing concrete index types
+          // with the dispatch variables above.
+
+          let state = AppState {
+              storage,
+              file_index: Arc::new(file_index),
+              chunk_index: Arc::new(chunk_index),
+              xorb_metadata_index: Arc::new(xorb_metadata_index),
+              config: Arc::new(config.clone()),
+              upload_sessions: upload_sessions.clone(),
+          };
+
+          // ... rest unchanged ...
+      }
+      ```
+
+      ## Task 3: Create stub rebuild.rs
+
+      File: `crates/server/src/rebuild.rs` (NEW)
+
+      Create a stub that will be replaced by A10:
+
+      ```rust
+      //! Rebuild index from storage data.
+      //! Full implementation provided by agent A10.
+
+      use crate::config::AppConfig;
+
+      pub async fn run_rebuild(config: &AppConfig) -> anyhow::Result<()> {
+          tracing::info!("rebuild-index not yet implemented");
+          anyhow::bail!("rebuild-index is not yet implemented — see spec/plan.yaml agent A10")
+      }
+      ```
+
+      ## Task 4: Update lib.rs
+
+      File: `crates/server/src/lib.rs`
+
+      Add the rebuild module:
+
+      ```rust
+      pub mod auth;
+      pub mod config;
+      pub mod error;
+      pub mod rebuild;
+      pub mod routes;
+      pub mod state;
+      pub mod storage;
+      ```
+
+      ## Verification
+
+      ```bash
+      cargo build -p openxet-server
+      cargo test -p openxet-server
+      ```
+
+      All existing tests must still pass. The route handlers still compile because
+      FileIndexDispatch implements FileIndex, ChunkIndexDispatch implements ChunkIndex,
+      and the route handlers use the trait methods (not concrete types).
+
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # LEVEL 3 — Route Handler Updates (depends on A5)
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  - id: A6
+    name: upload_routes_bulk_tx
+    level: 3
+    depends_on: [A5]
+    input_protos: [AppStateChanges]
+    output_protos: []
+    reads:
+      - crates/server/src/routes/xorb.rs
+      - crates/server/src/routes/shard.rs
+      - crates/server/src/state.rs
+      - crates/server/src/storage/index/mod.rs
+      - crates/server/src/storage/index/xorb_metadata.rs
+    writes:
+      - crates/server/src/routes/xorb.rs
+      - crates/server/src/routes/shard.rs
+    test_glob: "crates/server/src/routes/xorb.rs"
+    agent_prompt: |
+      # Agent A6: Upload Route Updates (xorb.rs + shard.rs)
+
+      You are updating the xorb and shard upload routes to:
+      1. Insert xorb_metadata on xorb upload
+      2. Use bulk transactions for chunk/file index inserts
+
+      ## Context
+
+      AppState now has:
+      - `xorb_metadata_index: Arc<XorbMetadataIndexDispatch>` (new)
+      - `chunk_index: Arc<ChunkIndexDispatch>` (was FilesystemChunkIndex)
+      - `file_index: Arc<FileIndexDispatch>` (was FilesystemFileIndex)
+
+      Traits now have `put_batch()` methods for bulk inserts.
+      `XorbMetadataIndex` trait has `put(xorb_hash, &[XorbChunkMetadata])`.
+
+      ## Task 1: Update xorb.rs — post_xorb()
+
+      File: `crates/server/src/routes/xorb.rs`
+
+      After parsing and validating the xorb (existing code at lines 42-56), add xorb_metadata
+      computation and storage:
+
+      ```rust
+      // After: let computed_hash = compute_xorb_hash(&chunk_hashes_and_sizes);
+      // After: state.storage.put_xorb(&hash, body).await?;
+
+      // Compute xorb metadata (byte offsets within the serialized xorb)
+      use openxet_cas_types::chunk::ChunkHeader;
+      use crate::storage::{XorbMetadataIndex, XorbChunkMetadata};
+
+      let mut xorb_metadata = Vec::with_capacity(chunk_hashes_and_sizes.len());
+      let mut compressed_pos = 0u64;
+      let mut uncompressed_pos = 0u64;
+
+      // Walk the raw xorb bytes to compute compressed offsets
+      // (body is the raw serialized xorb)
+      let mut pos = 0usize;
+      for (i, (chunk_hash, uncompressed_size)) in chunk_hashes_and_sizes.iter().enumerate() {
+          if pos + ChunkHeader::SIZE > body.len() { break; }
+          let header_bytes: [u8; 8] = body[pos..pos + 8].try_into().unwrap();
+          let header = ChunkHeader::from_bytes(&header_bytes)
+              .map_err(|e| AppError::Internal(anyhow::anyhow!("chunk header parse error: {e}")))?;
+
+          let chunk_start = pos as u64;
+          let chunk_end = (pos + ChunkHeader::SIZE + header.compressed_size as usize) as u64;
+
+          xorb_metadata.push(XorbChunkMetadata {
+              chunk_index: i as u32,
+              chunk_hash: chunk_hash.to_hex(),
+              compressed_offset_start: chunk_start,
+              compressed_offset_end: chunk_end,
+              uncompressed_offset: uncompressed_pos,
+              uncompressed_size: *uncompressed_size as u64,
+          });
+
+          uncompressed_pos += *uncompressed_size as u64;
+          pos = chunk_end as usize;
+      }
+
+      // Store xorb metadata
+      state.xorb_metadata_index.put(&hash, &xorb_metadata).await
+          .map_err(|e| AppError::Internal(anyhow::anyhow!("xorb metadata insert error: {e}")))?;
+
+      // Use bulk insert for chunk index (replaces per-chunk loop)
+      let chunk_entries: Vec<(String, ChunkLocation)> = chunk_hashes_and_sizes
+          .iter()
+          .enumerate()
+          .map(|(i, (ch, _))| (ch.to_hex(), ChunkLocation { xorb_hash: hash.clone(), chunk_index: i as u32 }))
+          .collect();
+      state.chunk_index.put_batch(&chunk_entries).await?;
+      ```
+
+      Remove the existing per-chunk `for` loop (lines 62-73) and replace with the bulk insert above.
+
+      IMPORTANT: The `body` variable is consumed by `state.storage.put_xorb(&hash, body)`.
+      You need the raw bytes for xorb_metadata computation. Clone or parse before the put_xorb call.
+      Actually, `put_xorb` takes `Bytes` by value. You can `.clone()` the Bytes before putting,
+      or compute metadata first, then put.
+
+      Strategy: compute metadata BEFORE put_xorb, then put_xorb, then insert indexes.
+
+      ## Task 2: Update shard.rs — post_shard()
+
+      File: `crates/server/src/routes/shard.rs`
+
+      Replace the per-entry loops with bulk inserts:
+
+      ```rust
+      // Replace lines 92-98 (file index loop) with:
+      let file_entries: Vec<(String, String)> = shard.file_info_blocks
+          .iter()
+          .map(|fb| (fb.header.file_hash.to_hex(), shard_hash_hex.clone()))
+          .collect();
+      state.file_index.put_batch(&file_entries).await?;
+
+      // Replace lines 101-115 (chunk index loop) with:
+      let chunk_entries: Vec<(String, ChunkLocation)> = shard.cas_info_blocks
+          .iter()
+          .flat_map(|cb| {
+              let xorb_hash = cb.header.cas_hash.to_hex();
+              cb.entries.iter().enumerate().map(move |(i, entry)| {
+                  (entry.chunk_hash.to_hex(), ChunkLocation {
+                      xorb_hash: xorb_hash.clone(),
+                      chunk_index: i as u32,
+                  })
+              })
+          })
+          .collect();
+      state.chunk_index.put_batch(&chunk_entries).await?;
+      ```
+
+      Add the necessary imports at the top of the file.
+
+      ## Tests
+
+      The existing tests for these routes are integration-level (they test the full HTTP flow).
+      Add unit tests if possible, or verify existing tests still pass.
+
+      ## Verification
+
+      ```bash
+      cargo test -p openxet-server -- routes::xorb
+      cargo test -p openxet-server -- routes::shard
+      ```
+
+  - id: A7
+    name: reconstruction_presigned
+    level: 3
+    depends_on: [A5]
+    input_protos: [AppStateChanges]
+    output_protos: []
+    reads:
+      - crates/server/src/routes/reconstruction.rs
+      - crates/server/src/state.rs
+      - crates/server/src/storage/index/xorb_metadata.rs
+      - crates/server/src/storage/dispatch.rs
+    writes:
+      - crates/server/src/routes/reconstruction.rs
+    test_glob: "crates/server/src/routes/reconstruction.rs"
+    agent_prompt: |
+      # Agent A7: Reconstruction Route — Presigned URLs + xorb_metadata
+
+      You are updating the reconstruction endpoint to:
+      1. Use presigned S3 URLs instead of server-proxied URLs (when configured)
+      2. Use xorb_metadata for byte offsets instead of fetching full xorbs
+
+      ## Context
+
+      Current behavior (crates/server/src/routes/reconstruction.rs):
+      - For each xorb in the reconstruction, fetches the FULL xorb from storage
+      - Parses chunk headers to compute byte offsets (compute_chunk_byte_offsets)
+      - Returns server-proxied URLs like `http://{host}/v1/xorbs/default/{hash}`
+
+      New behavior:
+      - Query xorb_metadata_index for byte offsets (no xorb fetch needed)
+      - If metadata not found, fall back to fetching xorb (backward compat)
+      - If presigned URLs available, use them instead of server-proxied URLs
+      - If presigned URLs not available, keep server-proxied URLs
+
+      ## Changes to get_reconstruction()
+
+      ### Step 1: Use xorb_metadata for byte offsets
+
+      Replace the `compute_chunk_byte_offsets` pattern:
+
+      ```rust
+      // OLD (lines 166-191):
+      // let xorb_data = state.storage.get_xorb(&term.hash).await?;
+      // let chunk_offsets = compute_chunk_byte_offsets(&xorb_data);
+
+      // NEW:
+      use crate::storage::{XorbMetadataIndex, StorageBackend};
+      use std::time::Duration;
+
+      let metadata = state.xorb_metadata_index.get(&term.hash).await?;
+
+      if !metadata.is_empty() {
+          // Use pre-computed offsets from xorb_metadata
+          let start_idx = term.range.start;
+          let end_idx = term.range.end.min(metadata.len());
+
+          if start_idx < metadata.len() {
+              let byte_start = metadata[start_idx].compressed_offset_start;
+              let byte_end = metadata[end_idx - 1].compressed_offset_end - 1; // inclusive
+
+              // Build URL (presigned or proxied)
+              let url = build_xorb_url(&state, &term.hash, &base_url).await?;
+
+              fetch_info.insert(
+                  term.hash.clone(),
+                  vec![CASReconstructionFetchInfo {
+                      range: term.range,
+                      url,
+                      url_range: ByteRange { start: byte_start as u64, end: byte_end as u64 },
+                  }],
+              );
+          }
+      } else {
+          // Fallback: fetch xorb and parse headers (original behavior)
+          let xorb_data = state.storage.get_xorb(&term.hash).await?;
+          let chunk_offsets = compute_chunk_byte_offsets(&xorb_data);
+          // ... existing logic ...
+      }
+      ```
+
+      ### Step 2: Presigned URL helper
+
+      Add a helper function:
+
+      ```rust
+      /// Build a URL for downloading a xorb. Uses presigned S3 URL if available,
+      /// otherwise falls back to server-proxied URL.
+      async fn build_xorb_url(
+          state: &AppState,
+          xorb_hash: &str,
+          fallback_base_url: &str,
+      ) -> Result<String, AppError> {
+          let expiry = Duration::from_secs(state.config.storage.presigned_url_expiry_seconds);
+          if let Some(url) = state.storage.presign_xorb_url(xorb_hash, expiry).await? {
+              // If external_s3_url is configured, replace the URL's host/port
+              // with the external URL so clients can reach it
+              if let Some(external) = &state.config.storage.external_s3_url {
+                  // The presigned URL from object_store uses the internal endpoint
+                  // (e.g., http://minio:9000). Replace with external URL.
+                  let presigned_str = url.to_string();
+                  if let Some(internal) = &state.config.storage.s3_endpoint {
+                      return Ok(presigned_str.replace(internal, external));
+                  }
+              }
+              Ok(url.to_string())
+          } else {
+              Ok(format!("{fallback_base_url}/v1/xorbs/default/{xorb_hash}"))
+          }
+      }
+      ```
+
+      ### Step 3: Keep compute_chunk_byte_offsets as fallback
+
+      Don't remove the existing `compute_chunk_byte_offsets` function — it's needed as fallback
+      when xorb_metadata is not populated (filesystem index backend).
+
+      ## Tests
+
+      Add tests in the `#[cfg(test)] mod tests` block:
+
+      1. `test_build_xorb_url_no_presign` — without presigned URL config, returns proxied URL
+      2. `test_compute_chunk_byte_offsets` — existing function still works correctly
+
+      ## Verification
+
+      ```bash
+      cargo test -p openxet-server -- routes::reconstruction
+      ```
+
+  - id: A8
+    name: dedup_route_fix
+    level: 3
+    depends_on: [A5]
+    input_protos: [AppStateChanges]
+    output_protos: []
+    reads:
+      - crates/server/src/routes/dedup.rs
+      - crates/server/src/state.rs
+      - crates/server/src/storage/index/mod.rs
+      - crates/server/src/storage/index/xorb_metadata.rs
+    writes:
+      - crates/server/src/routes/dedup.rs
+    test_glob: "crates/server/src/routes/dedup.rs"
+    agent_prompt: |
+      # Agent A8: Dedup Route Fix
+
+      You are rewriting the dedup endpoint to query SQLite indexes instead of
+      fetching and parsing full xorbs from S3.
+
+      ## Context
+
+      Current behavior (crates/server/src/routes/dedup.rs):
+      - Line 79: Looks up chunk hash in chunk_index → gets ChunkLocations (xorb_hash, chunk_index)
+      - Lines 99-101: For EACH xorb, fetches the ENTIRE xorb binary from S3
+      - Calls `parse_xorb_chunk_hashes()` to decompress every chunk and compute hashes
+      - Builds CASInfoBlock with HMAC'd chunk hashes and byte offsets
+      - This is extremely expensive: a single dedup query can fetch multiple multi-MB xorbs
+
+      New behavior:
+      - Use `xorb_metadata_index.get(xorb_hash)` to get all chunk hashes + byte offsets
+      - If xorb_metadata not found, fall back to fetching xorb (backward compat)
+      - The chunk hashes in xorb_metadata are the original (un-HMAC'd) hashes
+      - HMAC them with the random key as before
+
+      ## Changes to get_dedup()
+
+      Replace the xorb-fetching loop (lines 99-127) with index queries:
+
+      ```rust
+      for xorb_hash_hex in xorb_map.keys() {
+          let xorb_hash = MerkleHash::from_hex(xorb_hash_hex)
+              .map_err(|e| AppError::Internal(anyhow::anyhow!("bad stored hash: {e}")))?;
+
+          // Try xorb_metadata first (fast path — no S3 fetch)
+          let metadata = state.xorb_metadata_index.get(xorb_hash_hex).await
+              .map_err(|e| AppError::Internal(anyhow::anyhow!("xorb metadata query error: {e}")))?;
+
+          let (entries, total_uncompressed, xorb_disk_size) = if !metadata.is_empty() {
+              // Fast path: use pre-computed metadata
+              let total_uncompressed: u32 = metadata.iter()
+                  .map(|m| m.uncompressed_size as u32)
+                  .sum();
+              let xorb_disk_size: u32 = metadata.last()
+                  .map(|m| m.compressed_offset_end as u32)
+                  .unwrap_or(0);
+              let entries: Vec<CASChunkSequenceEntry> = metadata.iter()
+                  .map(|m| {
+                      let chunk_hash = MerkleHash::from_hex(&m.chunk_hash)
+                          .expect("stored chunk hash should be valid");
+                      CASChunkSequenceEntry {
+                          chunk_hash: hmac_hash(&hmac_key, &chunk_hash),
+                          chunk_byte_range_start: m.uncompressed_offset as u32,
+                          unpacked_segment_bytes: m.uncompressed_size as u32,
+                      }
+                  })
+                  .collect();
+              (entries, total_uncompressed, xorb_disk_size)
+          } else {
+              // Fallback: fetch and parse xorb (original behavior)
+              let xorb_data = state.storage.get_xorb(xorb_hash_hex).await?;
+              let chunk_info = parse_xorb_chunk_hashes(&xorb_data);
+              let total_uncompressed: u32 = chunk_info.iter().map(|(_, _, size)| size).sum();
+              let entries: Vec<CASChunkSequenceEntry> = chunk_info.iter()
+                  .map(|(ch, byte_start, size)| CASChunkSequenceEntry {
+                      chunk_hash: hmac_hash(&hmac_key, ch),
+                      chunk_byte_range_start: *byte_start,
+                      unpacked_segment_bytes: *size,
+                  })
+                  .collect();
+              (entries, total_uncompressed, xorb_data.len() as u32)
+          };
+
+          cas_info_blocks.push(CASInfoBlock {
+              header: CASChunkSequenceHeader {
+                  cas_hash: xorb_hash,
+                  cas_flags: 0,
+                  num_entries: entries.len() as u32,
+                  num_bytes_in_cas: total_uncompressed,
+                  num_bytes_on_disk: xorb_disk_size,
+              },
+              entries,
+          });
+      }
+      ```
+
+      Add the necessary imports:
+      ```rust
+      use crate::storage::XorbMetadataIndex;
+      ```
+
+      Keep the `parse_xorb_chunk_hashes` function — it's the fallback path.
+
+      ## Tests
+
+      Add unit tests:
+
+      1. `test_hmac_hash_deterministic` — same key + hash → same output
+      2. `test_parse_xorb_chunk_hashes_empty` — empty data returns empty vec
+
+      ## Verification
+
+      ```bash
+      cargo test -p openxet-server -- routes::dedup
+      ```
+
+  - id: A9
+    name: management_route_update
+    level: 3
+    depends_on: [A5]
+    input_protos: [AppStateChanges]
+    output_protos: []
+    reads:
+      - crates/server/src/routes/management.rs
+      - crates/server/src/state.rs
+      - crates/server/src/storage/index/xorb_metadata.rs
+    writes:
+      - crates/server/src/routes/management.rs
+    test_glob: "crates/server/src/routes/management.rs"
+    agent_prompt: |
+      # Agent A9: Management Route Updates
+
+      You are updating the management routes to:
+      1. Insert xorb_metadata during process_file_upload
+      2. Use presigned URLs in get_file_detail
+      3. Use xorb_metadata for byte offsets instead of fetching xorbs
+
+      ## Context
+
+      `management.rs` has two key functions to update:
+      - `process_file_upload()` — the shared upload pipeline (called by POST /api/upload and multipart complete)
+      - `get_file_detail()` — returns reconstruction info for the web UI
+
+      ## Task 1: Update process_file_upload() — xorb_metadata + bulk inserts
+
+      In the upload pipeline (lines 457-534), after storing each xorb, compute and store xorb_metadata.
+
+      Add xorb_metadata computation inside the `for group in &xorb_groups` loop:
+
+      ```rust
+      use crate::storage::{XorbMetadataIndex, XorbChunkMetadata, ChunkIndex, FileIndex};
+      use openxet_cas_types::chunk::ChunkHeader;
+
+      // After: state.storage.put_xorb(&xorb_hash_hex, Bytes::from(group.xorb_bytes.clone())).await?;
+
+      // Compute xorb_metadata from the serialized bytes
+      let mut metadata = Vec::with_capacity(local_count);
+      let mut pos = 0usize;
+      let mut uncompressed_pos = 0u64;
+      for local_i in 0..local_count {
+          let global_i = group.global_start + local_i;
+          if pos + ChunkHeader::SIZE > group.xorb_bytes.len() { break; }
+          let header_bytes: [u8; 8] = group.xorb_bytes[pos..pos + 8].try_into().unwrap();
+          let header = ChunkHeader::from_bytes(&header_bytes)
+              .map_err(|e| AppError::Internal(anyhow::anyhow!("chunk header error: {e}")))?;
+          let chunk_start = pos as u64;
+          let chunk_end = (pos + ChunkHeader::SIZE + header.compressed_size as usize) as u64;
+
+          metadata.push(XorbChunkMetadata {
+              chunk_index: local_i as u32,
+              chunk_hash: chunk_hashes[global_i].to_hex(),
+              compressed_offset_start: chunk_start,
+              compressed_offset_end: chunk_end,
+              uncompressed_offset: uncompressed_pos,
+              uncompressed_size: chunk_slices[global_i].len() as u64,
+          });
+
+          uncompressed_pos += chunk_slices[global_i].len() as u64;
+          pos = chunk_end as usize;
+      }
+
+      state.xorb_metadata_index.put(&xorb_hash_hex, &metadata).await
+          .map_err(|e| AppError::Internal(anyhow::anyhow!("xorb metadata error: {e}")))?;
+      ```
+
+      Replace the per-chunk index loop (lines 472-484) with bulk insert:
+
+      ```rust
+      let chunk_entries: Vec<(String, crate::storage::ChunkLocation)> = (0..local_count)
+          .map(|local_i| {
+              let global_i = group.global_start + local_i;
+              (chunk_hashes[global_i].to_hex(), crate::storage::ChunkLocation {
+                  xorb_hash: xorb_hash_hex.clone(),
+                  chunk_index: local_i as u32,
+              })
+          })
+          .collect();
+      state.chunk_index.put_batch(&chunk_entries).await?;
+      ```
+
+      Replace the file index put (line 572-574) — single entry, no batch needed but consistent:
+      ```rust
+      state.file_index.put(&file_hash_hex, &shard_hash_hex).await?;
+      ```
+      (This one is fine as-is since it's a single entry.)
+
+      ## Task 2: Update get_file_detail() — presigned URLs + xorb_metadata
+
+      Replace the xorb-fetching loop for byte offsets with xorb_metadata:
+
+      ```rust
+      // Replace lines 146-168 with:
+      for term in &terms {
+          if fetch_info.contains_key(&term.hash) { continue; }
+
+          let metadata = state.xorb_metadata_index.get(&term.hash).await
+              .unwrap_or_default();
+
+          if !metadata.is_empty() {
+              let start_idx = term.range.start;
+              let end_idx = term.range.end.min(metadata.len());
+              if start_idx < metadata.len() {
+                  let byte_start = metadata[start_idx].compressed_offset_start;
+                  let byte_end = metadata[end_idx - 1].compressed_offset_end - 1;
+
+                  // Use presigned URL if available
+                  let expiry = std::time::Duration::from_secs(
+                      state.config.storage.presigned_url_expiry_seconds
+                  );
+                  let url = if let Some(presigned) = state.storage.presign_xorb_url(&term.hash, expiry).await? {
+                      let url_str = presigned.to_string();
+                      if let (Some(external), Some(internal)) = (
+                          &state.config.storage.external_s3_url,
+                          &state.config.storage.s3_endpoint,
+                      ) {
+                          url_str.replace(internal, external)
+                      } else {
+                          url_str
+                      }
+                  } else {
+                      format!("{base_url}/xorbs/default/{}", term.hash)
+                  };
+
+                  fetch_info.insert(
+                      term.hash.clone(),
+                      vec![CASReconstructionFetchInfo {
+                          range: term.range,
+                          url,
+                          url_range: ByteRange { start: byte_start as u64, end: byte_end as u64 },
+                      }],
+                  );
+              }
+          } else {
+              // Fallback: original behavior
+              let xorb_data = state.storage.get_xorb(&term.hash).await?;
+              let chunk_offsets = compute_chunk_byte_offsets(&xorb_data);
+              let start_idx = term.range.start;
+              let end_idx = term.range.end.min(chunk_offsets.len());
+              if start_idx < chunk_offsets.len() {
+                  let byte_start = chunk_offsets[start_idx].0;
+                  let byte_end = chunk_offsets[end_idx - 1].1 - 1;
+                  fetch_info.insert(
+                      term.hash.clone(),
+                      vec![CASReconstructionFetchInfo {
+                          range: term.range,
+                          url: format!("{base_url}/xorbs/default/{}", term.hash),
+                          url_range: ByteRange { start: byte_start, end: byte_end },
+                      }],
+                  );
+              }
+          }
+      }
+      ```
+
+      ## Verification
+
+      ```bash
+      cargo test -p openxet-server -- routes::management
+      ```
+
+  - id: A10
+    name: rebuild_index_cli
+    level: 3
+    depends_on: [A5]
+    input_protos: [AppStateChanges]
+    output_protos: []
+    reads:
+      - crates/server/src/rebuild.rs
+      - crates/server/src/config.rs
+      - crates/server/src/storage/builder.rs
+      - crates/server/src/storage/index/sqlite.rs
+      - crates/cas_types/src/shard.rs
+      - crates/cas_types/src/xorb.rs
+      - crates/cas_types/src/chunk.rs
+    writes:
+      - crates/server/src/rebuild.rs
+    test_glob: "crates/server/src/rebuild.rs"
+    agent_prompt: |
+      # Agent A10: Rebuild-Index CLI
+
+      You are implementing the `openxet-server rebuild-index` subcommand.
+      It scans all shards and xorbs in S3/storage and populates the SQLite indexes from scratch.
+
+      ## Context
+
+      Agent A5 created a stub `crates/server/src/rebuild.rs`. You replace it with the full implementation.
+
+      The function signature is: `pub async fn run_rebuild(config: &AppConfig) -> anyhow::Result<()>`
+
+      It's called from main.rs when the user runs `openxet-server rebuild-index`.
+
+      ## Implementation
+
+      ```rust
+      use anyhow::Context;
+      use openxet_cas_types::chunk::ChunkHeader;
+      use openxet_cas_types::shard::Shard;
+      use openxet_hashing::compute_chunk_hash;
+
+      use crate::config::AppConfig;
+      use crate::storage::{
+          build_storage, StorageBackend,
+          SqliteFileIndex, SqliteChunkIndex, SqliteXorbMetadataIndex,
+          ChunkIndex, FileIndex, XorbMetadataIndex, XorbChunkMetadata,
+          ChunkLocation,
+      };
+
+      pub async fn run_rebuild(config: &AppConfig) -> anyhow::Result<()> {
+          tracing::info!("starting index rebuild");
+
+          // Build storage backend (S3/filesystem)
+          let storage = build_storage(&config.storage).await
+              .context("failed to initialize storage")?;
+
+          // Create fresh SQLite indexes
+          let db_path = config.data_dir().join("index.db");
+          if db_path.exists() {
+              tracing::warn!("removing existing index database: {}", db_path.display());
+              std::fs::remove_file(&db_path)?;
+          }
+
+          let file_index = SqliteFileIndex::new(&db_path)?;
+          let chunk_index = SqliteChunkIndex::new(&db_path)?;
+          let xorb_meta_index = SqliteXorbMetadataIndex::new(&db_path)?;
+
+          // Phase 1: Scan all xorbs
+          tracing::info!("scanning xorbs...");
+          let xorbs = storage.list_xorbs().await?;
+          tracing::info!("found {} xorbs", xorbs.len());
+
+          for (i, (xorb_hash, _size)) in xorbs.iter().enumerate() {
+              if (i + 1) % 100 == 0 || i + 1 == xorbs.len() {
+                  tracing::info!("processing xorb {}/{}", i + 1, xorbs.len());
+              }
+
+              let xorb_data = storage.get_xorb(xorb_hash).await?;
+
+              // Walk chunk headers to extract metadata
+              let mut metadata = Vec::new();
+              let mut chunk_entries = Vec::new();
+              let mut pos = 0usize;
+              let mut uncompressed_offset = 0u64;
+              let mut chunk_idx = 0u32;
+
+              while pos + ChunkHeader::SIZE <= xorb_data.len() {
+                  let header_bytes: [u8; 8] = xorb_data[pos..pos + 8].try_into().unwrap();
+                  let Ok(header) = ChunkHeader::from_bytes(&header_bytes) else { break; };
+
+                  let compressed_start = pos;
+                  let compressed_end = pos + ChunkHeader::SIZE + header.compressed_size as usize;
+                  if compressed_end > xorb_data.len() { break; }
+
+                  // Decompress to compute chunk hash
+                  let compressed = &xorb_data[pos + ChunkHeader::SIZE..compressed_end];
+                  let decompressed = openxet_cas_types::chunk::decompress_chunk(
+                      compressed,
+                      header.compression_type,
+                      header.uncompressed_size as usize,
+                  );
+
+                  if let Ok(data) = decompressed {
+                      let chunk_hash = compute_chunk_hash(&data);
+                      let chunk_hash_hex = chunk_hash.to_hex();
+
+                      metadata.push(XorbChunkMetadata {
+                          chunk_index: chunk_idx,
+                          chunk_hash: chunk_hash_hex.clone(),
+                          compressed_offset_start: compressed_start as u64,
+                          compressed_offset_end: compressed_end as u64,
+                          uncompressed_offset,
+                          uncompressed_size: data.len() as u64,
+                      });
+
+                      chunk_entries.push((
+                          chunk_hash_hex,
+                          ChunkLocation {
+                              xorb_hash: xorb_hash.clone(),
+                              chunk_index: chunk_idx,
+                          },
+                      ));
+
+                      uncompressed_offset += data.len() as u64;
+                  }
+
+                  chunk_idx += 1;
+                  pos = compressed_end;
+              }
+
+              // Bulk insert
+              if !metadata.is_empty() {
+                  xorb_meta_index.put(xorb_hash, &metadata).await?;
+              }
+              if !chunk_entries.is_empty() {
+                  chunk_index.put_batch(&chunk_entries).await?;
+              }
+          }
+
+          // Phase 2: Scan all shards
+          tracing::info!("scanning shards...");
+          let shards = storage.list_shards().await?;
+          tracing::info!("found {} shards", shards.len());
+
+          for (i, (shard_hash, _size)) in shards.iter().enumerate() {
+              if (i + 1) % 100 == 0 || i + 1 == shards.len() {
+                  tracing::info!("processing shard {}/{}", i + 1, shards.len());
+              }
+
+              let shard_data = storage.get_shard(shard_hash).await?;
+              let shard = match Shard::from_bytes(&shard_data) {
+                  Ok(s) => s,
+                  Err(e) => {
+                      tracing::warn!("skipping corrupt shard {}: {}", shard_hash, e);
+                      continue;
+                  }
+              };
+
+              // Index file hashes
+              let file_entries: Vec<(String, String)> = shard.file_info_blocks
+                  .iter()
+                  .map(|fb| (fb.header.file_hash.to_hex(), shard_hash.clone()))
+                  .collect();
+              if !file_entries.is_empty() {
+                  file_index.put_batch(&file_entries).await?;
+              }
+
+              // Index chunk hashes from CAS info (these may duplicate xorb-derived entries — that's OK)
+              let chunk_entries: Vec<(String, ChunkLocation)> = shard.cas_info_blocks
+                  .iter()
+                  .flat_map(|cb| {
+                      let xorb_hash = cb.header.cas_hash.to_hex();
+                      cb.entries.iter().enumerate().map(move |(i, entry)| {
+                          (entry.chunk_hash.to_hex(), ChunkLocation {
+                              xorb_hash: xorb_hash.clone(),
+                              chunk_index: i as u32,
+                          })
+                      })
+                  })
+                  .collect();
+              if !chunk_entries.is_empty() {
+                  chunk_index.put_batch(&chunk_entries).await?;
+              }
+          }
+
+          let file_count = file_index.list_all().await?.len();
+          tracing::info!(
+              "rebuild complete: {} files, {} xorbs, {} shards indexed",
+              file_count, xorbs.len(), shards.len()
+          );
+
+          Ok(())
+      }
+      ```
+
+      ## Tests
+
+      Add tests in `#[cfg(test)] mod tests`:
+
+      1. `test_rebuild_empty_storage` — rebuild with no xorbs or shards succeeds, indexes are empty
+      2. `test_rebuild_indexes_xorb_metadata` — create a test xorb, rebuild, verify xorb_metadata is populated
+
+      For tests, use `object_store::memory::InMemory` as the storage backend and
+      `tempfile::NamedTempFile` for the SQLite database.
+
+      Build test xorbs using `openxet_cas_types::xorb::serialize_single_chunk()`:
+      ```rust
+      use openxet_cas_types::xorb::serialize_single_chunk;
+      use openxet_cas_types::chunk::CompressionType;
+
+      let chunk_data = b"hello world test data for chunking";
+      let serialized = serialize_single_chunk(chunk_data, CompressionType::Lz4).unwrap();
+      // This is a valid xorb with one chunk
+      ```
+
+      ## Verification
+
+      ```bash
+      cargo test -p openxet-server -- rebuild
+      ```
+
+# ─── Coordinator Protocol ──────────────────────────────────────────────────────
+
+coordinator:
+  bootstrap: |
+    1. Read CLAUDE.md for project context
+    2. Read spec/contracts/*.proto for type contracts
+    3. Read spec/plan.yaml for full DAG
+    4. Run `cargo build && cargo test` to verify clean baseline
+    5. Check which agents' output files already exist — resume from there
+
+  dispatch: |
+    For each level (0, 1, 2, 3):
+      1. Launch all agents at this level in parallel
+      2. Each agent works on its exclusive file set
+      3. Each agent runs its own verification command
+      4. Wait for all agents to complete
+      5. Run gate check: `cargo build && cargo test`
+      6. If gate fails, identify which agent's output causes the failure
+      7. Fix or re-run that agent before proceeding
+
+  gate_checks:
+    level_0: "cargo build && cargo test"
+    level_1: "cargo build && cargo test"
+    level_2: "cargo build && cargo test"
+    level_3: "cargo build && cargo test && cargo clippy"
+
+  resume_protocol: |
+    To check completion status:
+    - A0: config.rs has `index_backend` field AND Cargo.toml has `rusqlite`
+    - A1: docker/compose.prod.yaml exists
+    - A2: crates/lfs-agent/src/main.rs exists
+    - A3: crates/server/src/storage/index/sqlite.rs exists AND has SqliteFileIndex
+    - A4: object_store_backend.rs has `signer` field
+    - A5: state.rs has `xorb_metadata_index` field
+    - A6: xorb.rs calls `xorb_metadata_index.put()`
+    - A7: reconstruction.rs has `build_xorb_url` or `presign_xorb_url`
+    - A8: dedup.rs has `xorb_metadata_index.get()`
+    - A9: management.rs calls `xorb_metadata_index.put()` in process_file_upload
+    - A10: rebuild.rs has `run_rebuild` function (not the stub)
+
+# ─── Hard Rules ────────────────────────────────────────────────────────────────
+
+hard_rules:
+  - "No agent imports another agent's internals — communicate through traits and types only"
+  - "Tests are the only completion signal — not compilation, not agent self-report"
+  - "File ownership is exclusive — no file appears in two agents' writes lists"
+  - "The coordinator never writes application code"
+  - "Proto contract files are the shared type definitions between agents"
+  - "Mock upstream, ignore downstream — each agent tests in isolation"
+  - "All rusqlite operations use std::sync::Mutex, not tokio::sync::Mutex"
+  - "All SQLite connections set PRAGMA journal_mode=WAL on open"
+  - "Bulk inserts MUST use explicit transactions (BEGIN/COMMIT)"
+  - "Presigned URL fallback is mandatory — if signer is None, use server-proxied URLs"
+  - "xorb_metadata fallback is mandatory — if metadata empty, fetch and parse xorb"
+  - "Keep the Rust edition 2024 features: let-chains in if-let, async trait methods"
+  - "Use thiserror for error types, anyhow for application errors"
+  - "Do NOT modify crates/hashing/, crates/chunking/, or crates/cas_types/"

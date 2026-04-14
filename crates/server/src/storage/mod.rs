@@ -11,5 +11,10 @@ pub use builder::build_storage;
 pub use dispatch::StorageDispatch;
 pub use error::StorageError;
 pub use filesystem::FilesystemBackend;
-pub use index::{ChunkIndex, ChunkLocation, FileIndex, FilesystemChunkIndex, FilesystemFileIndex};
+pub use index::{
+    ChunkIndex, ChunkIndexDispatch, ChunkLocation, FileIndex, FileIndexDispatch,
+    FilesystemChunkIndex, FilesystemFileIndex, NoopXorbMetadataIndex, SqliteChunkIndex,
+    SqliteFileIndex, SqliteXorbMetadataIndex, XorbChunkMetadata, XorbMetadataIndex,
+    XorbMetadataIndexDispatch,
+};
 pub use object_store_backend::ObjectStoreBackend;

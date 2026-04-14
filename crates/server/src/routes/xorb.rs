@@ -8,11 +8,13 @@ use serde::Serialize;
 use openxet_cas_types::xorb::{MAX_XORB_SIZE, compute_xorb_hash, deserialize_xorb};
 use openxet_hashing::{MerkleHash, compute_chunk_hash};
 
+use openxet_cas_types::chunk::ChunkHeader;
+
 use crate::auth::{RequireRead, RequireWrite};
 use crate::error::AppError;
 use crate::state::AppState;
 use crate::storage::index::ChunkLocation;
-use crate::storage::{ChunkIndex, StorageBackend, validate_hash};
+use crate::storage::{ChunkIndex, StorageBackend, XorbChunkMetadata, XorbMetadataIndex, validate_hash};
 
 #[derive(Debug, Serialize)]
 pub struct XorbUploadResponse {
@@ -55,22 +57,60 @@ pub async fn post_xorb(
         )));
     }
 
+    // Build xorb metadata from chunk headers before storing
+    let mut xorb_metadata = Vec::new();
+    {
+        let mut pos = 0usize;
+        let mut uncompressed_pos = 0u64;
+
+        for (i, (chunk_hash, uncompressed_size)) in chunk_hashes_and_sizes.iter().enumerate() {
+            if pos + ChunkHeader::SIZE > body.len() {
+                break;
+            }
+            let header_bytes: [u8; 8] = body[pos..pos + 8].try_into().unwrap();
+            let header = ChunkHeader::from_bytes(&header_bytes)
+                .map_err(|e| AppError::Internal(anyhow::anyhow!("chunk header parse error: {e}")))?;
+
+            let compressed_end = (pos + ChunkHeader::SIZE + header.compressed_size as usize) as u64;
+
+            xorb_metadata.push(XorbChunkMetadata {
+                chunk_index: i as u32,
+                chunk_hash: chunk_hash.to_hex(),
+                compressed_offset_start: pos as u64,
+                compressed_offset_end: compressed_end,
+                uncompressed_offset: uncompressed_pos,
+                uncompressed_size: *uncompressed_size as u64,
+            });
+
+            uncompressed_pos += *uncompressed_size as u64;
+            pos = compressed_end as usize;
+        }
+    }
+
     // Store the xorb
     state.storage.put_xorb(&hash, body).await?;
 
-    // Index each chunk
-    for (i, (chunk_hash, _)) in chunk_hashes_and_sizes.iter().enumerate() {
-        state
-            .chunk_index
-            .put(
-                &chunk_hash.to_hex(),
+    // Persist xorb metadata for fast reconstruction/dedup lookups
+    state
+        .xorb_metadata_index
+        .put(&hash, &xorb_metadata)
+        .await?;
+
+    // Batch index all chunks
+    let chunk_entries: Vec<(String, ChunkLocation)> = chunk_hashes_and_sizes
+        .iter()
+        .enumerate()
+        .map(|(i, (chunk_hash, _))| {
+            (
+                chunk_hash.to_hex(),
                 ChunkLocation {
                     xorb_hash: hash.clone(),
                     chunk_index: i as u32,
                 },
             )
-            .await?;
-    }
+        })
+        .collect();
+    state.chunk_index.put_batch(&chunk_entries).await?;
 
     Ok(Json(XorbUploadResponse { was_inserted: true }))
 }

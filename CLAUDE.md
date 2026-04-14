@@ -130,3 +130,51 @@ These are non-obvious details discovered during implementation and validated aga
 - All binary formats use little-endian byte order
 - Entry sizes are fixed at 48 bytes for both FileInfo and CASInfo entries in shards
 - Bookend entries: 32 bytes of `0xFF` + 16 bytes of `0x00`
+
+## Execution Plan
+
+This project has a DAG-based execution plan for the self-hosted production deployment work.
+
+- **Plan:** `spec/plan.yaml` — canonical DAG with 11 agents across 4 levels
+- **Contracts:** `spec/contracts/*.proto` — typed boundaries between agents
+- **Scope decisions:** `spec/scope.md` — answers to clarifying questions
+
+### Work Items
+
+| ID | Name | Description | Level |
+|----|------|-------------|-------|
+| W1 | SQLite indexes | Replace filesystem indexes with SQLite (A0, A3, A5, A6) | 0-3 |
+| W2 | Presigned URLs | Direct S3 downloads via presigned URLs (A0, A4, A5, A7, A9) | 0-3 |
+| W3 | Dedup fix | Query indexes instead of fetching xorbs (A8) | 3 |
+| W4 | Rebuild-index CLI | Scan storage to rebuild SQLite indexes (A10) | 3 |
+| W5 | Docker Compose | Production deployment with MinIO + Litestream (A1) | 0 |
+| W6 | LFS agent | Git-LFS custom transfer agent (A2) | 0 |
+
+### How to Execute
+
+```bash
+# 1. Read the plan
+cat spec/plan.yaml
+
+# 2. Launch Level 0 agents in parallel (A0, A1, A2)
+# 3. Gate: cargo build && cargo test
+# 4. Launch Level 1 (A3, A4), gate, Level 2 (A5), gate, Level 3 (A6-A10), gate
+
+# Resume: check which agents' files exist, skip completed, run next level
+```
+
+### Agent-Modified Files (exclusive ownership)
+
+```
+A0:  config.rs, server/Cargo.toml
+A1:  docker/compose.prod.yaml, docker/litestream.yml, docker/Caddyfile, docker/.env.example
+A2:  crates/lfs-agent/** , workspace Cargo.toml
+A3:  storage/index/** (all files)
+A4:  storage/object_store_backend.rs, storage/builder.rs, storage/dispatch.rs
+A5:  state.rs, main.rs, lib.rs, rebuild.rs (stub)
+A6:  routes/xorb.rs, routes/shard.rs
+A7:  routes/reconstruction.rs
+A8:  routes/dedup.rs
+A9:  routes/management.rs
+A10: rebuild.rs (full impl, replaces stub)
+```
