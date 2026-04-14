@@ -11,7 +11,8 @@ This repo is the self-hosted version: runs on your own hardware, backed by MinIO
 ## Quick Start
 
 ```bash
-# Prerequisites: Docker, just (optional: Rust + mise for local dev)
+# Prerequisites: Docker, just
+# That's it. No Rust, no Node, no Bun.
 
 # See available commands
 just
@@ -25,8 +26,11 @@ just dev
 # Generate an auth token
 just token
 
-# Run tests (requires Rust)
+# Run tests / lint / format (all via Docker)
 just test
+just lint
+just fmt
+just check   # all three
 ```
 
 ### Using with git-xet
@@ -158,6 +162,8 @@ just fmt       # Format
 just lint      # Clippy
 just check     # fmt + lint + test
 ```
+
+Everything runs in Docker — no local toolchain needed.
 
 ### Disaster Recovery
 

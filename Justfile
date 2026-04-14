@@ -1,18 +1,19 @@
 # OpenXet — Self-hosted Xet Protocol CAS Server
+# Everything runs in Docker. No Rust, Bun, or other toolchain needed.
 
 set dotenv-load := true
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
-export RUST_BACKTRACE := "1"
 compose := "docker compose -f docker/compose.selfhost.yaml"
 compose_local := "docker compose -f docker/compose.local.yaml"
 image := "openxet-server"
+dev_image := "openxet-dev"
 
 # List available recipes
 default:
     @just --list
 
-# ── Docker (no Rust required) ───────────────────────────────────────────────
+# ── Run ─────────────────────────────────────────────────────────────────────
 
 # Start the full self-hosted stack (MinIO + XetHub + Litestream + Caddy)
 up:
@@ -31,37 +32,43 @@ down:
 log *svc:
     {{ compose }} logs --tail 100 -f {{ svc }}
 
-# Generate an auth token via Docker (default: write scope, 24h expiry)
+# Generate an auth token (default: write scope, 24h expiry)
 token scope="write" repo="*/*":
+    @just _ensure-image
     @docker run --rm \
         -e OPENXET_AUTH_SECRET="${OPENXET_AUTH_SECRET:-change-me-in-production}" \
-        $({{ compose }} config --images 2>/dev/null | head -1 || echo "{{ image }}") \
-        generate-token --scope {{ scope }} --repo "{{ repo }}" \
-        2>/dev/null || \
-    (echo "Image not built yet — building..." && \
-        docker build -t {{ image }} -f docker/Dockerfile . && \
-        docker run --rm \
-            -e OPENXET_AUTH_SECRET="${OPENXET_AUTH_SECRET:-change-me-in-production}" \
-            {{ image }} \
-            generate-token --scope {{ scope }} --repo "{{ repo }}")
+        {{ image }} \
+        generate-token --scope {{ scope }} --repo "{{ repo }}"
 
-# ── Local development (requires Rust) ───────────────────────────────────────
+# ── Dev (test / lint / fmt) ─────────────────────────────────────────────────
 
-# Build release binary locally
-build-release:
-    cargo build --release
-
-# Run all tests locally
-test:
-    cargo test
-
-# Format code
-fmt:
-    cargo fmt --all
+# Run all tests
+test *args: _ensure-dev-image
+    docker run --rm -v "$(pwd)":/app -w /app {{ dev_image }} cargo test {{ args }}
 
 # Lint code
-lint:
-    cargo clippy -- -D warnings
+lint: _ensure-dev-image
+    docker run --rm -v "$(pwd)":/app -w /app {{ dev_image }} cargo clippy -- -D warnings
+
+# Format code
+fmt: _ensure-dev-image
+    docker run --rm -v "$(pwd)":/app -w /app {{ dev_image }} cargo fmt --all
+
+# Format check (no writes)
+fmt-check: _ensure-dev-image
+    docker run --rm -v "$(pwd)":/app -w /app {{ dev_image }} cargo fmt --all --check
 
 # Format + lint + test
 check: fmt lint test
+
+# ── Internal ────────────────────────────────────────────────────────────────
+
+# Build the runtime image if it doesn't exist
+_ensure-image:
+    @docker image inspect {{ image }} >/dev/null 2>&1 || \
+        (echo "Building {{ image }}..." && docker build -t {{ image }} -f docker/Dockerfile .)
+
+# Build the dev image if it doesn't exist
+_ensure-dev-image:
+    @docker image inspect {{ dev_image }} >/dev/null 2>&1 || \
+        (echo "Building {{ dev_image }}..." && docker build -t {{ dev_image }} -f docker/Dockerfile.dev .)
