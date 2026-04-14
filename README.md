@@ -105,10 +105,14 @@ Defined in `docker/compose.selfhost.yaml`. Configuration via environment variabl
 |----------|---------|-------------|
 | `OPENXET_AUTH_SECRET` | `change-me-in-production` | JWT signing secret |
 | `OPENXET_INDEX_BACKEND` | `sqlite` | Index backend (`sqlite` or `filesystem`) |
-| `OPENXET_EXTERNAL_S3_URL` | `http://localhost:9000` | Public MinIO URL for presigned downloads |
+| `OPENXET_EXTERNAL_S3_URL` | `http://localhost:9100` | Public MinIO URL for presigned downloads |
 | `OPENXET_PRESIGNED_URL_EXPIRY` | `3600` | Presigned URL TTL in seconds |
 | `MINIO_ROOT_USER` | `minioadmin` | MinIO credentials |
 | `MINIO_ROOT_PASSWORD` | `minioadmin` | MinIO credentials |
+| `MINIO_PORT` | `9100` | MinIO S3 API host port |
+| `MINIO_CONSOLE_PORT` | `9101` | MinIO web console host port |
+| `CADDY_HTTP_PORT` | `8880` | Caddy HTTP host port |
+| `CADDY_HTTPS_PORT` | `8443` | Caddy HTTPS host port |
 
 ### Dedup Performance
 

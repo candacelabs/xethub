@@ -3,6 +3,12 @@
 # Usage:
 #   docker compose -f docker/compose.selfhost.yaml up -d
 #
+# Port overrides (set in .env or environment):
+#   MINIO_PORT=9100       MinIO S3 API
+#   MINIO_CONSOLE_PORT=9101  MinIO web console
+#   CADDY_HTTP_PORT=8880  Caddy HTTP
+#   CADDY_HTTPS_PORT=8443 Caddy HTTPS
+#
 # This sets up:
 #   - MinIO: S3-compatible object storage for xorbs and shards
 #   - OpenXet: CAS server with SQLite indexes
@@ -14,8 +20,8 @@ services:
     image: minio/minio:latest
     command: server /data --console-address ":9001"
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "${MINIO_PORT:-9100}:9000"
+      - "${MINIO_CONSOLE_PORT:-9101}:9001"
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
@@ -63,7 +69,7 @@ services:
       OPENXET_S3_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
       OPENXET_S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
       OPENXET_S3_ALLOW_HTTP: "true"
-      OPENXET_EXTERNAL_S3_URL: ${OPENXET_EXTERNAL_S3_URL:-http://localhost:9000}
+      OPENXET_EXTERNAL_S3_URL: ${OPENXET_EXTERNAL_S3_URL:-http://localhost:${MINIO_PORT:-9100}}
       OPENXET_PRESIGNED_URL_EXPIRY: "3600"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/api/stats"]
@@ -90,8 +96,8 @@ services:
   caddy:
     image: caddy:2-alpine
     ports:
-      - "80:80"
-      - "443:443"
+      - "${CADDY_HTTP_PORT:-8880}:80"
+      - "${CADDY_HTTPS_PORT:-8443}:443"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data
