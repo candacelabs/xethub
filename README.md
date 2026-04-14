@@ -45,25 +45,28 @@ git push  # only changed chunks are uploaded
 
 ## Architecture
 
-```
-┌─────────────┐     ┌──────────────┐     ┌─────────────┐
-│   Gitea     │     │   XetHub     │     │    MinIO     │
-│  (git repo) │     │  (CAS API)   │────▶│  (S3 store)  │
-└─────────────┘     └──────────────┘     └─────────────┘
-       │                    │
-       │            ┌──────────────┐
-       │            │   SQLite     │──── Litestream ──▶ MinIO backup
-       │            │  (indexes)   │
-       │            └──────────────┘
-       │
-  git push/pull         ▲
-  (pointers)            │ chunked upload/download
-       │                │ (presigned URLs)
-       ▼                ▼
-    ┌─────────────────────┐
-    │      git-xet        │
-    │  (transfer agent)   │
-    └─────────────────────┘
+```mermaid
+graph LR
+    subgraph Client
+        GX[git-xet<br/>transfer agent]
+    end
+
+    subgraph On-Prem
+        Gitea[Gitea<br/>git repo]
+        XH[XetHub<br/>CAS API]
+        SQ[(SQLite<br/>indexes)]
+        MI[MinIO<br/>S3 store]
+        LS[Litestream]
+        CA[Caddy<br/>reverse proxy]
+    end
+
+    GX -- "git push/pull<br/>(pointers)" --> Gitea
+    GX -- "chunked upload/download<br/>(presigned URLs)" --> CA
+    CA --> XH
+    XH --> MI
+    XH --> SQ
+    SQ -- "continuous replication" --> LS
+    LS --> MI
 ```
 
 - **Gitea** — stores git history, `.gitattributes`, LFS pointer files
